@@ -1,0 +1,133 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+env:
+  UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+  MOLD_SUPPRESS_MACHO_WARNING: 1
+jobs:
+  build-clang:
+    strategy:
+      matrix:
+        target:
+        # Disable PCH for the default configuration. This prevents relying on implicit includes.
+        - '-DCMAKE_DISABLE_PRECOMPILE_HEADERS=On'
+        - '-DMOLD_USE_ASAN=On'
+        - '-DMOLD_USE_TSAN=On'
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v3
+    - uses: rui314/setup-mold@staging
+    - name: install-build-deps
+      run: sudo ./install-build-deps.sh update
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1
+    - name: build and test
+      run: |
+        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+        sudo apt-get install -y clang++-12
+        mkdir build
+        cd build
+        cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++-12 ${{ matrix.target }} ..
+        cmake --build . -j$(nproc)
+        ctest . -j$(nproc)
+    - name: archive test results
+      uses: actions/upload-artifact@v3
+      if: failure()
+      with:
+        name: test-results-clang
+        path: |
+          build/out
+          build/Testing
+
+  build-gcc:
+    runs-on: ubuntu-20.04
+    container: gcc:11.1.0
+    steps:
+    - uses: actions/checkout@v3
+    - name: install-build-deps
+      run: |
+        # Install cross toolchains
+        dpkg --add-architecture i386
+        ./install-build-deps.sh update
+        apt-get install -y sudo qemu-user gdb zstd dwarfdump {gcc,g++}-10-{i686,aarch64,riscv64,powerpc,powerpc64,powerpc64le,s390x,sparc64,m68k,sh4,alpha}-linux-gnu {gcc,g++}-10-arm-linux-gnueabihf
+
+        for i in i686 aarch64 riscv64 powerpc powerpc64 powerpc64le s390x sparc64 m68k sh4 alpha; do
+          ln -sf /usr/bin/$i-linux-gnu-gcc-10 /usr/bin/$i-linux-gnu-gcc
+          ln -sf /usr/bin/$i-linux-gnu-g++-10 /usr/bin/$i-linux-gnu-g++
+        done
+
+        ln -sf /usr/bin/arm-linux-gnueabihf-gcc-10 /usr/bin/arm-linux-gnueabihf-gcc
+        ln -sf /usr/bin/arm-linux-gnueabihf-g++-10 /usr/bin/arm-linux-gnueabihf-g++
+
+        # Install a RV32 toolchain from third party since it's not available
+        # as an Ubuntu package.
+        mkdir /usr/local/rv32
+        wget -O- -q https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2022.08.26/riscv32-glibc-ubuntu-20.04-nightly-2022.08.26-nightly.tar.gz | tar -C /usr/local/rv32 --strip-components=1 -xzf -
+
+        ln -sf /usr/local/rv32/sysroot /usr/riscv32-linux-gnu
+        ln -sf /usr/local/rv32/bin/riscv32-unknown-linux-gnu-objdump /usr/bin/riscv32-linux-gnu-objdump
+        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-gcc -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-gcc
+        echo '/usr/local/rv32/bin/riscv32-unknown-linux-gnu-g++ -L/usr/riscv32-linux-gnu "$@"' > /usr/bin/riscv32-linux-gnu-g++
+        chmod 755 /usr/bin/riscv32-linux-gnu-gcc /usr/bin/riscv32-linux-gnu-g++
+      shell: bash
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1
+    - name: build and test
+      run: |
+        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+        mkdir build
+        cd build
+        cmake -DMOLD_ENABLE_QEMU_TESTS=On -DMOLD_ENABLE_QEMU_TESTS_RV32=On ..
+        cmake --build . -j$(nproc)
+        ctest . -j$(nproc)
+    - name: archive test results
+      uses: actions/upload-artifact@v3
+      if: failure()
+      with:
+        name: test-results-gcc
+        path: |
+          build/out
+          build/Testing
+
+  build-macos:
+    runs-on: macos-11
+    strategy:
+      matrix:
+        target:
+        # Disable PCH for the default configuration. This prevents relying on implicit includes.
+        - '-DCMAKE_DISABLE_PRECOMPILE_HEADERS=On'
+        - '-DMOLD_USE_ASAN=On'
+    steps:
+    - uses: actions/checkout@v3
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1
+    - name: build and test
+      run: |
+        echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+        mkdir build
+        cd build
+        cmake ${{ matrix.target }} ..
+        cmake --build . -j$(sysctl -n hw.physicalcpu)
+        ctest . -j$(sysctl -n hw.physicalcpu)
+    - name: archive test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-macos
+        path: |
+          build/out
+          build/Testing
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: build
+      run: |
+        mkdir build
+        cd build
+        cmake -T clangcl ..
+        cmake --build . -j $Env:NUMBER_OF_PROCESSORS

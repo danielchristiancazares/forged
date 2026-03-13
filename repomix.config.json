@@ -1,0 +1,30 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "output": {
+    "filePath": "sold.txt",
+    "style": "plain",
+    "showLineNumbers": true,
+    "topFilesLength": 10,
+    "includeEmptyDirectories": false,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100
+    }
+  },
+  "include": [],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "third-party/**",
+      "out/**",
+      "dist/**",
+      "benchmarks/**",
+      "repomix-output.*",
+      "*.tar.gz",
+      "test/**",
+      "docs/chart.svg",
+      ".github/**"
+    ]
+  }
+}

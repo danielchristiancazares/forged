@@ -1,0 +1,13 @@
+[[target]]
+name = "forge"
+project_root = "/Users/dcazares/Documents/Code/forge-fresh"
+cargo_args = ["build", "--release", "-p", "forge", "--bin", "forge"]
+binary_relpath = "target/release/forge"
+smoke_cmd = ["/bin/test", "-x", "{binary}"]
+
+[[target]]
+name = "tools-mcp"
+project_root = "/Users/dcazares/Documents/Code/tools-mcp"
+cargo_args = ["build", "--release", "--bin", "tools-mcp"]
+binary_relpath = "target/release/tools-mcp"
+smoke_cmd = ["{binary}", "--help"]

@@ -83,27 +83,28 @@ void do_lto(Context<E> &ctx) {
     ctx.lto.codegen_debug_options(cg, opt.c_str());
 
   for (ObjectFile<E> *file : ctx.objs)
-    if (file->lto_module)
+    if (file->lto_module && file->is_alive)
       ctx.lto.codegen_add_module(cg, file->lto_module);
 
   // Mark symbols that have to be preserved. All symbols that are not
-  // marked here may be internalized and deleted as an extenrally-
-  // visible symbol.
-  if (ctx.output_type == MH_DYLIB || ctx.arg.export_dynamic) {
-    for (ObjectFile<E> *file : ctx.objs) {
-      if (!file->lto_module) {
-        for (i64 i = 0; i < file->mach_syms.size(); i++) {
-          MachSym<E> &msym = file->mach_syms[i];
-          Symbol<E> &sym = *file->syms[i];
-          if (msym.is_undef() && !sym.file->is_dylib &&
-              ((ObjectFile<E> *)sym.file)->lto_module)
-            ctx.lto.codegen_add_must_preserve_symbol(cg, sym.name.data());
-        }
+  // marked here may be internalized and deleted as an externally-visible
+  // symbol. Definitions referenced by regular objects must always survive,
+  // even for executables.
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (!file->lto_module) {
+      for (i64 i = 0; i < file->mach_syms.size(); i++) {
+        MachSym<E> &msym = file->mach_syms[i];
+        Symbol<E> &sym = *file->syms[i];
+        if (msym.is_undef() && !sym.file->is_dylib &&
+            ((ObjectFile<E> *)sym.file)->lto_module)
+          ctx.lto.codegen_add_must_preserve_symbol(cg, sym.name.data());
       }
     }
+  }
 
+  if (ctx.output_type == MH_DYLIB || ctx.arg.export_dynamic) {
     for (ObjectFile<E> *file : ctx.objs)
-      if (file->lto_module)
+      if (file->lto_module && file->is_alive)
         for (Symbol<E> *sym : file->syms)
           if (sym->file == file && sym->visibility != SCOPE_LOCAL)
             ctx.lto.codegen_add_must_preserve_symbol(cg, sym->name.data());

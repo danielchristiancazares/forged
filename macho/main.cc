@@ -33,7 +33,7 @@ split_string(std::string_view str, char sep) {
 template <typename E>
 static bool has_lto_obj(Context<E> &ctx) {
   for (ObjectFile<E> *file : ctx.objs)
-    if (file->lto_module)
+    if (file->lto_module && file->is_alive)
       return true;
   return false;
 }
@@ -50,34 +50,42 @@ static void resolve_symbols(Context<E> &ctx) {
     file->resolve_symbols(ctx);
   });
 
-  if (has_lto_obj(ctx))
+  auto mark_live_objects = [&] {
+    // We want to keep symbols that may be referenced indirectly.
+    for (std::string_view name : ctx.arg.u)
+      if (InputFile<E> *file = get_symbol(ctx, name)->file)
+        file->is_alive = true;
+
+    if (InputFile<E> *file = ctx.arg.entry->file)
+      file->is_alive = true;
+
+    if (InputFile<E> *file = ctx._objc_msgSend->file; file && file->is_dylib)
+      file->is_alive = true;
+
+    if (!ctx.arg.fixup_chains)
+      if (InputFile<E> *file = ctx.dyld_stub_binder->file; file && file->is_dylib)
+        file->is_alive = true;
+
+    std::vector<ObjectFile<E> *> live_objs;
+    for (ObjectFile<E> *file : ctx.objs)
+      if (file->is_alive)
+        live_objs.push_back(file);
+
+    for (i64 i = 0; i < live_objs.size(); i++) {
+      live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
+        live_objs.push_back(file);
+      });
+    }
+  };
+
+  // Choose archive members before running LTO so archive IR obeys regular
+  // archive extraction semantics. Rerun reachability after LTO because the
+  // synthesized object may reference additional archive members.
+  mark_live_objects();
+
+  if (has_lto_obj(ctx)) {
     do_lto(ctx);
-
-  // We want to keep symbols may be referenced indirectly.
-  for (std::string_view name : ctx.arg.u)
-    if (InputFile<E> *file = get_symbol(ctx, name)->file)
-      file->is_alive = true;
-
-  if (InputFile<E> *file = ctx.arg.entry->file)
-    file->is_alive = true;
-
-  if (InputFile<E> *file = ctx._objc_msgSend->file; file && file->is_dylib)
-    file->is_alive = true;
-
-  if (!ctx.arg.fixup_chains)
-    if (InputFile<E> *file = ctx.dyld_stub_binder->file; file && file->is_dylib)
-      file->is_alive = true;
-
-  // Mark reachable object files
-  std::vector<ObjectFile<E> *> live_objs;
-  for (ObjectFile<E> *file : ctx.objs)
-    if (file->is_alive)
-      live_objs.push_back(file);
-
-  for (i64 i = 0; i < live_objs.size(); i++) {
-    live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
-      live_objs.push_back(file);
-    });
+    mark_live_objects();
   }
 
   // Remove symbols of eliminated files.
@@ -269,8 +277,15 @@ static void remove_unreferenced_subsections(Context<E> &ctx) {
       MachSym<E> &msym = file->mach_syms[i];
       Symbol<E> &sym = *file->syms[i];
       if (sym.file != file && (msym.type == N_SECT) &&
-          (msym.desc & N_WEAK_DEF) && !(msym.desc & N_ALT_ENTRY))
-        file->sym_to_subsec[i]->is_alive = false;
+          (msym.desc & N_WEAK_DEF) && !(msym.desc & N_ALT_ENTRY)) {
+        // Some weak definitions live in always-split sections such as __cstring
+        // and therefore don't have a direct sym_to_subsec entry.
+        Subsection<E> *subsec = file->sym_to_subsec[i];
+        if (!subsec)
+          subsec = file->find_subsection(ctx, msym.value);
+        if (subsec)
+          subsec->is_alive = false;
+      }
     }
 
     std::erase_if(file->subsections, [](Subsection<E> *subsec) {
@@ -879,7 +894,7 @@ static void copy_sections_to_output_file(Context<E> &ctx) {
 
 template <typename E>
 static void compute_uuid(Context<E> &ctx) {
-  Timer t(ctx, "copy_sections_to_output_file");
+  Timer t(ctx, "compute_uuid");
 
   // Compute a markle tree of height two.
   i64 filesize = ctx.output_file->filesize;
@@ -935,7 +950,8 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   }
   case FileType::AR:
     for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
-      if (get_file_type(ctx, child) == FileType::MACH_OBJ) {
+      FileType type = get_file_type(ctx, child);
+      if (type == FileType::MACH_OBJ || type == FileType::LLVM_BITCODE) {
         ObjectFile<E> *file = ObjectFile<E>::create(ctx, child, mf->name);
         ctx.tg.run([file, &ctx] { file->parse(ctx); });
         ctx.objs.push_back(file);

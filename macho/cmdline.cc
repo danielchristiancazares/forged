@@ -52,7 +52,7 @@ Options:
   -dead_strip_dylibs          Remove unreachable dylibs from dependencies
   -debug_variant              Ignored
   -demangle                   Demangle C++ symbols in log messages (default)
-  -dependency_info <FILE>     Ignored
+  -dependency_info <FILE>     Write dependency information to a given file
   -dylib                      Produce a dynamic library
   -dylib_compatibility_version <VERSION>
                               Alias for -compatibility_version
@@ -529,7 +529,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       std::string key = std::string(arg) + "," + std::string(arg2);
       if (!has_single_bit(val))
         Fatal(ctx) << "-sectalign: invalid alignment value: " << arg3;
-      ctx.arg.sectalign.push_back({arg, arg2, (u8)std::countl_zero(val)});
+      ctx.arg.sectalign.push_back({arg, arg2, (u8)std::countr_zero(val)});
     } else if (read_arg3("-sectcreate")) {
       ctx.arg.sectcreate.push_back({arg, arg2, arg3});
     } else if (read_hex("-stack_size")) {

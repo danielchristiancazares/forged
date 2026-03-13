@@ -15,4 +15,4 @@ gentoo
 out
 /mold-*.tar.gz
 /build*
-/benchmarks/out
+/benchmarks/out*/

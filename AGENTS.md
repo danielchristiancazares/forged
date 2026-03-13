@@ -62,6 +62,8 @@ Recent code-level bring-up details that should not be regressed:
 
 ## Working Rules For Agents
 
+- You MUST NOT call codex.list_mcp_resources or codex.list_mcp_resource_templates. 
+  * They don't provide any useful information.
 - Treat the core linker as a C++20 codebase. The benchmark harness is
   Python/TOML with Rust/Cargo integration. On non-MSVC builds, the C++ linker
   code compiles with `-fno-exceptions`, `-fno-unwind-tables`, and
@@ -372,13 +374,13 @@ Current corpus details:
 
 Practical benchmark caveats:
 
-- `benchmarks/out` is ignored and generated, not source
+- `benchmarks/out*` directories are ignored and generated, not source
 - a shared output tree can become inconsistent if another benchmark run is
   still building or cleaning the same Cargo target directory
 - if you need reliable bring-up or A/B comparison data, use a dedicated
   `--out-dir`
-- only the default `benchmarks/out` path is ignored by `.gitignore`; custom
-  output directories are not ignored automatically
+- output directories named `benchmarks/out*` are ignored by `.gitignore`;
+  other custom output directories are not ignored automatically
 - `benchmarks/out-direct-replay/results.json` is currently the cleanest
   verified replay-only baseline for real sold-vs-Apple results in this
   worktree, but it is still a local generated artifact rather than a tracked

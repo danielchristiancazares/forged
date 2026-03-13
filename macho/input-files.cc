@@ -1098,7 +1098,7 @@ template <typename E>
 Subsection<E> *
 ObjectFile<E>::add_methname_string(Context<E> &ctx, std::string_view contents) {
   assert(this == ctx.internal_obj);
-  assert(contents[contents.size()] == '\0');
+  assert(contents.find('\0') == std::string_view::npos);
 
   u64 addr = 0;
   if (!sections.empty()) {
@@ -1120,7 +1120,8 @@ ObjectFile<E>::add_methname_string(Context<E> &ctx, std::string_view contents) {
   // Create a dummy InputSection
   InputSection<E> *isec = new InputSection<E>(ctx, *this, *msec, sections.size());
   sections.emplace_back(isec);
-  isec->contents = contents;
+  std::string_view str = save_string(ctx, std::string(contents));
+  isec->contents = {str.data(), str.size() + 1};
 
   Subsection<E> *subsec = new Subsection<E>{
     .isec = isec,

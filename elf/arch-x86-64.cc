@@ -187,6 +187,30 @@ static u32 relax_gotpc32_tlsdesc(u8 *loc) {
   return 0;
 }
 
+template <typename E>
+static i64 get_tls_relax_prefix(const ElfRel<E> &rel) {
+  switch (rel.r_type) {
+  case R_X86_64_PLT32:
+  case R_X86_64_PC32:
+  case R_X86_64_GOTPCREL:
+  case R_X86_64_GOTPCRELX:
+    return 4;
+  case R_X86_64_PLTOFF64:
+    return 3;
+  default:
+    unreachable();
+  }
+}
+
+template <typename E>
+static void check_relax_prefix(Context<E> &ctx, InputSection<E> &isec,
+                               const ElfRel<E> &rel, i64 prefix,
+                               std::string_view name) {
+  if (rel.r_offset < prefix)
+    Fatal(ctx) << isec << ": " << name << " relocation is used"
+               << " against an invalid code sequence";
+}
+
 // Rewrite a function call to __tls_get_addr to a cheaper instruction
 // sequence. We can do this when we know the thread-local variable's TP-
 // relative address at link-time.
@@ -425,7 +449,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       // We always want to relax GOTPCRELX relocs even if --no-relax
       // was given because some static PIE runtime code depends on these
       // relaxations.
-      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
+      if (rel.r_offset >= 2 && !sym.is_imported && !sym.is_ifunc() &&
+          sym.is_relative()) {
         u32 insn = relax_gotpcrelx(loc - 2);
         i64 val = S + A - P;
         if (insn && (i32)val == val) {
@@ -438,7 +463,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_REX_GOTPCRELX:
-      if (!sym.is_imported && !sym.is_ifunc() && sym.is_relative()) {
+      if (rel.r_offset >= 3 && !sym.is_imported && !sym.is_ifunc() &&
+          sym.is_relative()) {
         u32 insn = relax_rex_gotpcrelx(loc - 3);
         i64 val = S + A - P;
         if (insn && (i32)val == val) {
@@ -455,9 +481,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsgd(ctx)) {
         write32s(sym.get_tlsgd_addr(ctx) + A - P);
       } else if (sym.has_gottp(ctx)) {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSGD");
         relax_gd_to_ie(loc, rels[i + 1], sym.get_gottp_addr(ctx) - P);
         i++;
       } else {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSGD");
         relax_gd_to_le(loc, rels[i + 1], S - ctx.tp_addr);
         i++;
       }
@@ -466,6 +496,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (ctx.got->has_tlsld(ctx)) {
         write32s(ctx.got->get_tlsld_addr(ctx) + A - P);
       } else {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSLD");
         relax_ld_to_le(loc, rels[i + 1], ctx.tp_addr - ctx.tls_begin);
         i++;
       }
@@ -486,7 +518,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_gottp(ctx)) {
         write32s(sym.get_gottp_addr(ctx) + A - P);
       } else {
+        check_relax_prefix(ctx, *this, rel, 3, "GOTTPOFF");
         u32 insn = relax_gottpoff(loc - 3);
+        if (!insn)
+          Fatal(ctx) << *this << ": GOTTPOFF relocation is used"
+                     << " against an invalid code sequence";
         loc[-3] = insn >> 16;
         loc[-2] = insn >> 8;
         loc[-1] = insn;
@@ -498,7 +534,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsdesc(ctx)) {
         write32s(sym.get_tlsdesc_addr(ctx) + A - P);
       } else {
+        check_relax_prefix(ctx, *this, rel, 3, "GOTPC32_TLSDESC");
         u32 insn = relax_gotpc32_tlsdesc(loc - 3);
+        if (!insn)
+          Fatal(ctx) << *this << ": GOTPC32_TLSDESC relocation is used"
+                     << " against an invalid code sequence";
         loc[-3] = insn >> 16;
         loc[-2] = insn >> 8;
         loc[-1] = insn;
@@ -701,9 +741,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
           (ctx.arg.relax && !sym.is_imported && !ctx.arg.shared)) {
         // We always relax if -static because libc.a doesn't contain
         // __tls_get_addr().
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSGD");
         i++;
       } else if (ctx.arg.relax && !sym.is_imported && ctx.arg.shared &&
                  !ctx.arg.z_dlopen) {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSGD");
         sym.flags |= NEEDS_GOTTP;
         i++;
       } else {
@@ -725,16 +769,19 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
-      if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared))
+      if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared)) {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLSLD");
         i++;
-      else
+      } else {
         ctx.needs_tlsld = true;
+      }
       break;
     case R_X86_64_GOTTPOFF: {
       if (rel.r_addend != -4)
         Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTTPOFF";
 
-      bool do_relax = ctx.arg.relax && !ctx.arg.shared &&
+      bool do_relax = rel.r_offset >= 3 && ctx.arg.relax && !ctx.arg.shared &&
                       !sym.is_imported && relax_gottpoff(loc - 3);
       if (!do_relax)
         sym.flags |= NEEDS_GOTTP;
@@ -744,7 +791,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       if (rel.r_addend != -4)
         Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTPC32_TLSDESC";
 
-      if (relax_gotpc32_tlsdesc(loc - 3) == 0)
+      if (rel.r_offset < 3 || relax_gotpc32_tlsdesc(loc - 3) == 0)
         Fatal(ctx) << *this << ": GOTPC32_TLSDESC relocation is used"
                    << " against an invalid code sequence";
 

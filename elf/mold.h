@@ -1264,6 +1264,7 @@ private:
   void initialize_sections(Context<E> &ctx);
   void initialize_symbols(Context<E> &ctx);
   void sort_relocations(Context<E> &ctx);
+  void validate_relocations(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
   void read_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
   void read_ehframe(Context<E> &ctx, InputSection<E> &isec);

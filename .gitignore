@@ -16,3 +16,4 @@ out
 /mold-*.tar.gz
 /build*
 /benchmarks/out*/
+sold.txt

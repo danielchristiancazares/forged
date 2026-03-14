@@ -202,6 +202,29 @@ static u32 relax_got32x(u8 *loc) {
   return 0;
 }
 
+template <typename E>
+static i64 get_tls_relax_prefix(const ElfRel<E> &rel) {
+  switch (rel.r_type) {
+  case R_386_PLT32:
+  case R_386_PC32:
+    return 3;
+  case R_386_GOT32:
+  case R_386_GOT32X:
+    return 2;
+  default:
+    unreachable();
+  }
+}
+
+template <typename E>
+static void check_relax_prefix(Context<E> &ctx, InputSection<E> &isec,
+                               const ElfRel<E> &rel, i64 prefix,
+                               std::string_view name) {
+  if (rel.r_offset < prefix)
+    Fatal(ctx) << isec << ": " << name << " relocation is used"
+               << " against an invalid code sequence";
+}
+
 // Relax GD to LE
 static void relax_gd_to_le(u8 *loc, ElfRel<E> rel, u64 val) {
   static const u8 insn[] = {
@@ -315,8 +338,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_got(ctx)) {
         *(ul32 *)loc = G + A;
       } else {
+        check_relax_prefix(ctx, *this, rel, 2, "GOT32X");
         u32 insn = relax_got32x(loc - 2);
-        assert(insn);
+        if (!insn)
+          Fatal(ctx) << *this << ": GOT32X relocation is used"
+                     << " against an invalid code sequence";
         loc[-2] = insn >> 8;
         loc[-1] = insn;
         *(ul32 *)loc = S + A - GOT;
@@ -341,6 +367,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsgd(ctx)) {
         *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - GOT;
       } else {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLS_GD");
         relax_gd_to_le(loc, rels[i + 1], S - ctx.tp_addr);
         i++;
       }
@@ -349,6 +377,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (ctx.got->has_tlsld(ctx)) {
         *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - GOT;
       } else {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLS_LDM");
         relax_ld_to_le(loc, rels[i + 1], ctx.tp_addr - ctx.tls_begin);
         i++;
       }
@@ -363,6 +393,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsdesc(ctx)) {
         *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - GOT;
       } else {
+        check_relax_prefix(ctx, *this, rel, 2, "TLS_GOTDESC");
         static const u8 insn[] = {
           0x8d, 0x05, 0, 0, 0, 0, // lea 0, %eax
         };
@@ -496,7 +527,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_GOT32X: {
       // We always want to relax GOT32X because static PIE doesn't
       // work without it.
-      bool do_relax = !sym.is_imported && sym.is_relative() &&
+      bool do_relax = rel.r_offset >= 2 && !sym.is_imported && sym.is_relative() &&
                       relax_got32x(loc - 2);
       if (!do_relax)
         sym.flags |= NEEDS_GOT;
@@ -522,10 +553,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
       if (ctx.arg.is_static ||
-          (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported))
+          (ctx.arg.relax && !ctx.arg.shared && !sym.is_imported)) {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLS_GD");
         i++;
-      else
+      } else {
         sym.flags |= NEEDS_TLSGD;
+      }
       break;
     case R_386_TLS_LDM:
       if (i + 1 == rels.size())
@@ -538,12 +572,17 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
       // We always relax if -static because libc.a doesn't contain
       // __tls_get_addr().
-      if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared))
+      if (ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared)) {
+        check_relax_prefix(ctx, *this, rel, get_tls_relax_prefix(rels[i + 1]),
+                           "TLS_LDM");
         i++;
-      else
+      } else {
         ctx.needs_tlsld = true;
+      }
       break;
     case R_386_TLS_GOTDESC:
+      if (relax_tlsdesc(ctx, sym))
+        check_relax_prefix(ctx, *this, rel, 2, "TLS_GOTDESC");
       if (!relax_tlsdesc(ctx, sym))
         sym.flags |= NEEDS_TLSDESC;
       break;

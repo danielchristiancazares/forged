@@ -80,6 +80,8 @@ read_compunits(Context<E> &ctx, ObjectFile<E> &file) {
     if (*(U32<E> *)data.data() == 0xffff'ffff)
       Fatal(ctx) << *file.debug_info << ": --gdb-index: DWARF64 not supported";
     i64 len = *(U32<E> *)data.data() + 4;
+    if (len > data.size())
+      Fatal(ctx) << *file.debug_info << ": corrupted .debug_info";
     vec.push_back(data.substr(0, len));
     data = data.substr(len);
   }
@@ -111,12 +113,17 @@ std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file) {
   auto read = [&](InputSection<E> &isec) {
     isec.uncompress(ctx);
     std::string_view contents = isec.contents;
+    auto corrupted = [&](std::string_view msg) {
+      Fatal(ctx) << isec << ": corrupted " << msg;
+    };
 
     while (!contents.empty()) {
       if (contents.size() < 14)
-        Fatal(ctx) << isec << ": corrupted header";
+        corrupted("header");
 
       u32 len = *(U32<E> *)contents.data() + 4;
+      if (len < 14 || len > contents.size())
+        corrupted("header");
       u32 debug_info_offset = *(U32<E> *)(contents.data() + 6);
       u32 cu_idx = get_cu_idx(isec, debug_info_offset);
 
@@ -124,16 +131,25 @@ std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file) {
       contents = contents.substr(len);
 
       while (!data.empty()) {
+        if (data.size() < 4)
+          corrupted("record");
+
         u32 offset = *(U32<E> *)data.data();
         data = data.substr(4);
         if (offset == 0)
           break;
 
+        if (data.empty())
+          corrupted("record");
         u8 type = data[0];
         data = data.substr(1);
 
-        std::string_view name = data.data();
-        data = data.substr(name.size() + 1);
+        size_t len = data.find('\0');
+        if (len == std::string_view::npos)
+          corrupted("record");
+
+        std::string_view name = data.substr(0, len);
+        data = data.substr(len + 1);
 
         vec.push_back({name, gdb_hash(name), (type << 24) | cu_idx});
       }

@@ -435,6 +435,9 @@ std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) con
 // If not, record that error and returns true.
 template <typename E>
 bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) {
+  if (file.symbols.size() <= rel.r_sym)
+    Fatal(ctx) << *this << ": invalid relocation symbol index: " << rel.r_sym;
+
   // If a relocation refers to a linker-synthesized symbol for a
   // section fragment, it's always been resolved.
   if (file.elf_syms.size() <= rel.r_sym)

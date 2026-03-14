@@ -185,6 +185,18 @@ struct LeafEq {
   }
 };
 
+template <typename E>
+static void update_leader(Atomic<InputSection<E> *> &leader,
+                          InputSection<E> *isec) {
+  InputSection<E> *cur = leader.load();
+  assert(cur);
+
+  while (isec->get_priority() < cur->get_priority())
+    if (leader.compare_exchange_weak(cur, isec, Atomic<InputSection<E> *>::relaxed,
+                                     Atomic<InputSection<E> *>::relaxed))
+      break;
+}
+
 // Early merge of leaf nodes, which can be processed without constructing the
 // entire graph. This reduces the vertex count and improves memory efficiency.
 template <typename E>
@@ -195,7 +207,7 @@ static void merge_leaf_nodes(Context<E> &ctx) {
   static Counter non_eligible("icf_non_eligibles");
   static Counter leaf("icf_leaf_nodes");
 
-  tbb::concurrent_unordered_map<InputSection<E> *, InputSection<E> *,
+  tbb::concurrent_unordered_map<InputSection<E> *, Atomic<InputSection<E> *>,
                                 LeafHasher<E>, LeafEq<E>> map;
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
@@ -211,9 +223,9 @@ static void merge_leaf_nodes(Context<E> &ctx) {
       if (is_leaf(ctx, *isec)) {
         leaf++;
         isec->icf_leaf = true;
-        auto [it, inserted] = map.insert({isec.get(), isec.get()});
-        if (!inserted && isec->get_priority() < it->second->get_priority())
-          it->second = isec.get();
+        auto [it, inserted] = map.emplace(isec.get(), isec.get());
+        if (!inserted)
+          update_leader(it->second, isec.get());
       } else {
         eligible++;
         isec->icf_eligible = true;
@@ -226,7 +238,7 @@ static void merge_leaf_nodes(Context<E> &ctx) {
       if (isec && isec->is_alive && isec->icf_leaf) {
         auto it = map.find(isec.get());
         assert(it != map.end());
-        isec->leader = it->second;
+        isec->leader = it->second.load();
       }
     }
   });
@@ -567,20 +579,20 @@ void icf_sections(Context<E> &ctx) {
   {
     Timer t(ctx, "group");
 
-    auto *map = new tbb::concurrent_unordered_map<Digest, InputSection<E> *>;
+    auto *map = new tbb::concurrent_unordered_map<Digest, Atomic<InputSection<E> *>>;
     std::span<Digest> digest = digests[slot];
 
     tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
       InputSection<E> *isec = sections[i];
-      auto [it, inserted] = map->insert({digest[i], isec});
-      if (!inserted && isec->get_priority() < it->second->get_priority())
-        it->second = isec;
+      auto [it, inserted] = map->emplace(digest[i], isec);
+      if (!inserted)
+        update_leader(it->second, isec);
     });
 
     tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
       auto it = map->find(digest[i]);
       assert(it != map->end());
-      sections[i]->leader = it->second;
+      sections[i]->leader = it->second.load();
     });
 
     // Since free'ing the map is slow, postpone it.

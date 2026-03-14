@@ -21,7 +21,20 @@ InputFile<E>::InputFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)mf->data;
   is_dso = (ehdr.e_type == ET_DYN);
 
-  ElfShdr<E> *sh_begin = (ElfShdr<E> *)(mf->data + ehdr.e_shoff);
+  auto corrupted = [&](u64 num_sections) -> void {
+    Fatal(ctx) << mf->name << ": e_shoff or e_shnum corrupted: "
+               << mf->size << " " << num_sections;
+  };
+
+  u64 shoff = ehdr.e_shoff;
+  u64 filesize = mf->size;
+  if (shoff > filesize)
+    corrupted(ehdr.e_shnum);
+  if ((ehdr.e_shnum == 0 || ehdr.e_shstrndx == SHN_XINDEX) &&
+      filesize - shoff < sizeof(ElfShdr<E>))
+    corrupted(ehdr.e_shnum);
+
+  ElfShdr<E> *sh_begin = (ElfShdr<E> *)(mf->data + shoff);
 
   // e_shnum contains the total number of sections in an object file.
   // Since it is a 16-bit integer field, it's not large enough to
@@ -29,9 +42,8 @@ InputFile<E>::InputFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   // sections, the actual number is stored to sh_size field.
   i64 num_sections = (ehdr.e_shnum == 0) ? sh_begin->sh_size : ehdr.e_shnum;
 
-  if (mf->data + mf->size < (u8 *)(sh_begin + num_sections))
-    Fatal(ctx) << mf->name << ": e_shoff or e_shnum corrupted: "
-               << mf->size << " " << num_sections;
+  if ((u64)num_sections > (filesize - shoff) / sizeof(ElfShdr<E>))
+    corrupted(num_sections);
   elf_sections = {sh_begin, sh_begin + num_sections};
 
   // e_shstrndx is a 16-bit field. If .shstrtab's section index is
@@ -366,11 +378,19 @@ void ObjectFile<E>::read_ehframe(Context<E> &ctx, InputSection<E> &isec) {
   // Read CIEs and FDEs until empty.
   std::string_view contents = this->get_string(ctx, isec.shdr());
   i64 rel_idx = 0;
+  auto corrupted = [&] {
+    Fatal(ctx) << isec << ": corrupted .eh_frame";
+  };
 
   for (std::string_view data = contents; !data.empty();) {
+    if (data.size() < 4)
+      corrupted();
+
     i64 size = *(U32<E> *)data.data();
     if (size == 0)
       break;
+    if (size < 4 || data.size() < size + 4)
+      corrupted();
 
     i64 begin_offset = data.data() - contents.data();
     i64 end_offset = begin_offset + size + 4;
@@ -547,11 +567,27 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
   }
 }
 
+template <typename E>
+void ObjectFile<E>::validate_relocations(Context<E> &ctx) {
+  for (std::unique_ptr<InputSection<E>> &isec : sections) {
+    if (!isec)
+      continue;
+
+    for (const ElfRel<E> &rel : isec->get_rels(ctx))
+      if (rel.r_sym >= this->elf_syms.size())
+        Fatal(ctx) << *isec << ": invalid relocation symbol index: "
+                   << rel.r_sym;
+  }
+}
+
 static size_t find_null(std::string_view data, u64 entsize) {
   if (entsize == 1)
     return data.find('\0');
 
-  for (i64 i = 0; i <= data.size() - entsize; i += entsize)
+  if (data.size() < entsize)
+    return data.npos;
+
+  for (size_t i = 0; i + entsize <= data.size(); i += entsize)
     if (data.substr(i, entsize).find_first_not_of('\0') == data.npos)
       return i;
 
@@ -809,7 +845,11 @@ void ObjectFile<E>::mark_addrsig(Context<E> &ctx) {
     u8 *end = cur + llvm_addrsig->contents.size();
 
     while (cur != end) {
-      Symbol<E> &sym = *this->symbols[read_uleb(cur)];
+      u64 idx;
+      if (!read_uleb(cur, end, idx) || idx >= this->symbols.size())
+        Fatal(ctx) << *llvm_addrsig << ": corrupted .llvm_addrsig";
+
+      Symbol<E> &sym = *this->symbols[idx];
       if (sym.file == this)
         if (InputSection<E> *isec = sym.get_input_section())
           isec->address_significant = true;
@@ -844,6 +884,7 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
   initialize_sections(ctx);
   initialize_symbols(ctx);
   sort_relocations(ctx);
+  validate_relocations(ctx);
   initialize_ehframe_sections(ctx);
 }
 

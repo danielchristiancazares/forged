@@ -30,6 +30,24 @@
 
 namespace mold {
 
+inline std::optional<u64> parse_ar_num(std::string_view str) {
+  while (!str.empty() && str.back() == ' ')
+    str.remove_suffix(1);
+
+  if (str.empty())
+    return {};
+
+  u64 val = 0;
+  for (u8 c : str) {
+    if (c < '0' || c > '9')
+      return {};
+    if (val > (UINT64_MAX - (c - '0')) / 10)
+      return {};
+    val = val * 10 + (c - '0');
+  }
+  return val;
+}
+
 struct ArHdr {
   char ar_name[16];
   char ar_date[12];
@@ -51,28 +69,61 @@ struct ArHdr {
     return starts_with("/ ") || starts_with("/SYM64/ ");
   }
 
-  std::string read_name(std::string_view strtab, u8 *&ptr) const {
+  bool has_valid_fmag() const {
+    return ar_fmag[0] == '`' && ar_fmag[1] == '\n';
+  }
+
+  std::optional<u64> get_size() const {
+    return parse_ar_num({ar_size, sizeof(ar_size)});
+  }
+
+  std::optional<u64> get_bsd_name_len() const {
+    if (!starts_with("#1/"))
+      return {};
+    return parse_ar_num({ar_name + 3, sizeof(ar_name) - 3});
+  }
+
+  std::optional<u64> get_sysv_name_offset() const {
+    if (!starts_with("/"))
+      return {};
+    return parse_ar_num({ar_name + 1, sizeof(ar_name) - 1});
+  }
+
+  std::optional<std::string>
+  read_name(std::string_view strtab, std::string_view body, u64 &name_size) const {
+    name_size = 0;
+
     // BSD-style long filename
     if (starts_with("#1/")) {
-      int namelen = atoi(ar_name + 3);
-      std::string name{(char *)ptr, (size_t)namelen};
-      ptr += namelen;
+      std::optional<u64> namelen = get_bsd_name_len();
+      if (!namelen || *namelen > body.size())
+        return {};
 
-      if (size_t pos = name.find('\0'))
+      std::string name(body.substr(0, *namelen));
+      name_size = *namelen;
+
+      if (size_t pos = name.find('\0'); pos != std::string::npos)
         name = name.substr(0, pos);
       return name;
     }
 
     // SysV-style long filename
     if (starts_with("/")) {
-      const char *start = strtab.data() + atoi(ar_name + 1);
-      return {start, (const char *)strstr(start, "/\n")};
+      std::optional<u64> offset = get_sysv_name_offset();
+      if (!offset || *offset >= strtab.size())
+        return {};
+
+      std::string_view name = strtab.substr(*offset);
+      size_t pos = name.find("/\n");
+      if (pos == std::string_view::npos)
+        return {};
+      return std::string(name.substr(0, pos));
     }
 
     // Short fileanme
     if (const char *end = (char *)memchr(ar_name, '/', sizeof(ar_name)))
-      return {ar_name, end};
-    return {ar_name, sizeof(ar_name)};
+      return std::string(ar_name, end);
+    return std::string(ar_name, sizeof(ar_name));
   }
 };
 
@@ -81,45 +132,62 @@ std::vector<MappedFile *>
 read_thin_archive_members(Context &ctx, MappedFile *mf) {
   u8 *begin = mf->data;
   u8 *data = begin + 8;
+  u8 *end = begin + mf->size;
   std::vector<MappedFile *> vec;
   std::string_view strtab;
+  auto corrupted = [&] { Fatal(ctx) << mf->name << ": corrupted archive"; };
 
-  while (data < begin + mf->size) {
+  while (data < end) {
     // Each header is aligned to a 2 byte boundary.
-    if ((begin - data) % 2)
+    if ((data - begin) % 2)
       data++;
+    if (data == end)
+      break;
+    if (end - data < sizeof(ArHdr))
+      corrupted();
 
     ArHdr &hdr = *(ArHdr *)data;
+    if (!hdr.has_valid_fmag())
+      corrupted();
+
     u8 *body = data + sizeof(hdr);
-    u64 size = atol(hdr.ar_size);
+    std::optional<u64> size = hdr.get_size();
+    if (!size || (u64)(end - body) < *size)
+      corrupted();
 
     // Read a string table.
     if (hdr.is_strtab()) {
-      strtab = {(char *)body, (size_t)size};
-      data = body + size;
+      strtab = {(char *)body, (size_t)*size};
+      data = body + *size;
       continue;
     }
 
     // Skip a symbol table.
     if (hdr.is_symtab()) {
-      data = body + size;
+      data = body + *size;
       continue;
     }
 
     if (!hdr.starts_with("#1/") && !hdr.starts_with("/"))
       Fatal(ctx) << mf->name << ": filename is not stored as a long filename";
 
-    std::string name = hdr.read_name(strtab, body);
+    u64 name_size;
+    std::optional<std::string> name =
+      hdr.read_name(strtab, {(char *)body, (size_t)*size}, name_size);
+    if (!name)
+      corrupted();
 
     // Skip if symbol table
-    if (name == "__.SYMDEF" || name == "__.SYMDEF SORTED")
+    if (*name == "__.SYMDEF" || *name == "__.SYMDEF SORTED") {
+      data = body + name_size;
       continue;
+    }
 
-    std::string path = name.starts_with('/') ?
-      name : (filepath(mf->name).parent_path() / name).string();
+    std::string path = name->starts_with('/') ?
+      *name : (filepath(mf->name).parent_path() / *name).string();
     vec.push_back(MappedFile::must_open(ctx, path));
     vec.back()->thin_parent = mf;
-    data = body;
+    data = body + name_size;
   }
   return vec;
 }
@@ -128,21 +196,32 @@ template <typename Context, typename MappedFile>
 std::vector<MappedFile *> read_fat_archive_members(Context &ctx, MappedFile *mf) {
   u8 *begin = mf->data;
   u8 *data = begin + 8;
+  u8 *end = begin + mf->size;
   std::vector<MappedFile *> vec;
   std::string_view strtab;
+  auto corrupted = [&] { Fatal(ctx) << mf->name << ": corrupted archive"; };
 
-  while (begin + mf->size - data >= 2) {
-    if ((begin - data) % 2)
+  while (data < end) {
+    if ((data - begin) % 2)
       data++;
+    if (data == end)
+      break;
+    if (end - data < sizeof(ArHdr))
+      corrupted();
 
     ArHdr &hdr = *(ArHdr *)data;
+    if (!hdr.has_valid_fmag())
+      corrupted();
+
     u8 *body = data + sizeof(hdr);
-    u64 size = atol(hdr.ar_size);
-    data = body + size;
+    std::optional<u64> size = hdr.get_size();
+    if (!size || (u64)(end - body) < *size)
+      corrupted();
+    data = body + *size;
 
     // Read if string table
     if (hdr.is_strtab()) {
-      strtab = {(char *)body, (size_t)size};
+      strtab = {(char *)body, (size_t)*size};
       continue;
     }
 
@@ -151,13 +230,17 @@ std::vector<MappedFile *> read_fat_archive_members(Context &ctx, MappedFile *mf)
       continue;
 
     // Read the name field
-    std::string name = hdr.read_name(strtab, body);
+    u64 name_size;
+    std::optional<std::string> name =
+      hdr.read_name(strtab, {(char *)body, (size_t)*size}, name_size);
+    if (!name || name_size > *size)
+      corrupted();
 
     // Skip if symbol table
-    if (name == "__.SYMDEF" || name == "__.SYMDEF SORTED")
+    if (*name == "__.SYMDEF" || *name == "__.SYMDEF SORTED")
       continue;
 
-    vec.push_back(mf->slice(ctx, name, body - begin, data - body));
+    vec.push_back(mf->slice(ctx, *name, body - begin + name_size, *size - name_size));
   }
   return vec;
 }

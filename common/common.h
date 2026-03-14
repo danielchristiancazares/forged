@@ -410,6 +410,37 @@ inline u64 read_uleb(u8 const*&buf) {
   return read_uleb(const_cast<u8 *&>(buf));
 }
 
+inline bool read_uleb(u8 *&buf, u8 *end, u64 &val) {
+  val = 0;
+
+  for (i64 i = 0; buf < end && i < 10; i++) {
+    u8 byte = *buf++;
+
+    if (i == 9 && (byte & 0xfe))
+      return false;
+
+    val |= (u64)(byte & 0x7f) << (i * 7);
+    if (!(byte & 0x80))
+      return true;
+  }
+  return false;
+}
+
+inline bool read_uleb(u8 const*&buf, u8 const *end, u64 &val) {
+  return read_uleb(const_cast<u8 *&>(buf), const_cast<u8 *>(end), val);
+}
+
+inline bool read_uleb(std::string_view &str, u64 &val) {
+  u8 const *start = (u8 const *)str.data();
+  u8 const *ptr = start;
+
+  if (!read_uleb(ptr, start + str.size(), val))
+    return false;
+
+  str = str.substr(ptr - start);
+  return true;
+}
+
 inline u64 read_uleb(std::string_view &str) {
   u8 *start = (u8 *)&str[0];
   u8 *ptr = start;

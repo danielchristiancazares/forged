@@ -121,28 +121,32 @@ void MultiGlob::compile() {
 }
 
 void MultiGlob::fix_suffix_links(TrieNode &node) {
-  for (i64 i = 0; i < 256; i++) {
-    if (!node.children[i])
+  std::queue<TrieNode *> queue;
+
+  for (std::unique_ptr<TrieNode> &child : node.children) {
+    if (!child)
       continue;
+    child->suffix_link = root.get();
+    queue.push(child.get());
+  }
 
-    TrieNode &child = *node.children[i];
+  while (!queue.empty()) {
+    TrieNode *cur = queue.front();
+    queue.pop();
 
-    TrieNode *cur = node.suffix_link;
-    for (;;) {
-      if (!cur) {
-        child.suffix_link = root.get();
-        break;
-      }
+    for (i64 i = 0; i < 256; i++) {
+      if (!cur->children[i])
+        continue;
 
-      if (cur->children[i]) {
-        child.suffix_link = cur->children[i].get();
-        break;
-      }
+      TrieNode &child = *cur->children[i];
+      TrieNode *suffix = cur->suffix_link;
 
-      cur = cur->suffix_link;
+      while (suffix && !suffix->children[i])
+        suffix = suffix->suffix_link;
+
+      child.suffix_link = suffix ? suffix->children[i].get() : root.get();
+      queue.push(&child);
     }
-
-    fix_suffix_links(child);
   }
 }
 

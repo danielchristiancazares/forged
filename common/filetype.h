@@ -30,30 +30,100 @@ bool is_text_file(MappedFile *mf) {
          isprint(data[2]) && isprint(data[3]);
 }
 
+inline std::optional<std::string_view>
+get_elf_data(std::string_view data, u64 offset, u64 size) {
+  if (offset > (u64)data.size() || size > (u64)data.size() - offset)
+    return {};
+  return data.substr(offset, size);
+}
+
+template <typename T>
+inline std::optional<std::span<T>>
+get_elf_span(std::string_view data, u64 offset, u64 size) {
+  if (size % sizeof(T))
+    return {};
+  if (std::optional<std::string_view> view = get_elf_data(data, offset, size))
+    return std::span<T>{(T *)view->data(), view->size() / sizeof(T)};
+  return {};
+}
+
+inline std::optional<std::string_view>
+get_elf_string(std::string_view strtab, u64 offset) {
+  if (offset > (u64)strtab.size())
+    return {};
+
+  std::string_view str = strtab.substr(offset);
+  size_t len = str.find('\0');
+  if (len == std::string_view::npos)
+    return {};
+  return str.substr(0, len);
+}
+
+template <typename E>
+inline std::optional<std::span<elf::ElfShdr<E>>>
+get_elf_shdrs(std::string_view data) {
+  using namespace mold::elf;
+
+  if (data.size() < sizeof(ElfEhdr<E>))
+    return {};
+
+  ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)data.data();
+  u64 shoff = ehdr.e_shoff;
+
+  if (shoff > (u64)data.size())
+    return {};
+
+  u64 remain = data.size() - shoff;
+  if ((ehdr.e_shnum == 0 || ehdr.e_shstrndx == SHN_XINDEX) &&
+      remain < sizeof(ElfShdr<E>))
+    return {};
+
+  ElfShdr<E> *sh_begin = (ElfShdr<E> *)(data.data() + shoff);
+  u64 num_sections = ehdr.e_shnum ? ehdr.e_shnum : sh_begin->sh_size;
+
+  if (num_sections > remain / sizeof(ElfShdr<E>))
+    return {};
+  return std::span<ElfShdr<E>>{sh_begin, (size_t)num_sections};
+}
+
 template <typename E, typename Context, typename MappedFile>
 inline bool is_gcc_lto_obj(Context &ctx, MappedFile *mf) {
   using namespace mold::elf;
 
-  const char *data = mf->get_contents().data();
-  ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)data;
-  ElfShdr<E> *sh_begin = (ElfShdr<E> *)(data + ehdr.e_shoff);
-  std::span<ElfShdr<E>> shdrs{(ElfShdr<E> *)(data + ehdr.e_shoff), ehdr.e_shnum};
+  std::string_view data = mf->get_contents();
+  if (data.size() < sizeof(ElfEhdr<E>))
+    return false;
+
+  ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)data.data();
+  std::optional<std::span<ElfShdr<E>>> shdrs = get_elf_shdrs<E>(data);
+  if (!shdrs)
+    return false;
 
   // e_shstrndx is a 16-bit field. If .shstrtab's section index is
   // too large, the actual number is stored to sh_link field.
-  i64 shstrtab_idx = (ehdr.e_shstrndx == SHN_XINDEX)
-    ? sh_begin->sh_link : ehdr.e_shstrndx;
+  u64 shstrtab_idx = (ehdr.e_shstrndx == SHN_XINDEX)
+    ? (*shdrs)[0].sh_link : ehdr.e_shstrndx;
+  if (shstrtab_idx >= shdrs->size())
+    return false;
 
-  for (ElfShdr<E> &sec : shdrs) {
+  std::optional<std::string_view> shstrtab =
+    get_elf_data(data, (*shdrs)[shstrtab_idx].sh_offset,
+                 (*shdrs)[shstrtab_idx].sh_size);
+  if (!shstrtab)
+    return false;
+
+  for (ElfShdr<E> &sec : *shdrs) {
     // GCC FAT LTO objects contain both regular ELF sections and GCC-
     // specific LTO sections, so that they can be linked as LTO objects if
     // the LTO linker plugin is available and falls back as regular
     // objects otherwise. GCC FAT LTO object can be identified by the
     // presence of `.gcc.lto_.symtab` section.
     if (!ctx.arg.plugin.empty()) {
-      std::string_view name = data + shdrs[shstrtab_idx].sh_offset + sec.sh_name;
-      if (name.starts_with(".gnu.lto_.symtab."))
-      return true;
+      std::optional<std::string_view> name = get_elf_string(*shstrtab, sec.sh_name);
+      if (!name)
+        return false;
+      if (name->starts_with(".gnu.lto_.symtab."))
+        return true;
     }
 
     if (sec.sh_type != SHT_SYMTAB)
@@ -62,21 +132,34 @@ inline bool is_gcc_lto_obj(Context &ctx, MappedFile *mf) {
     // GCC non-FAT LTO object contains only sections symbols followed by
     // a common symbol whose name is `__gnu_lto_slim` (or `__gnu_lto_v1`
     // for older GCC releases).
-    std::span<ElfSym<E>> elf_syms{(ElfSym<E> *)(data + sec.sh_offset),
-                                  (size_t)sec.sh_size / sizeof(ElfSym<E>)};
+    std::optional<std::span<ElfSym<E>>> elf_syms =
+      get_elf_span<ElfSym<E>>(data, sec.sh_offset, sec.sh_size);
+    if (!elf_syms)
+      return false;
 
     auto skip = [](u8 type) {
       return type == STT_NOTYPE || type == STT_FILE || type == STT_SECTION;
     };
 
     i64 i = 1;
-    while (i < elf_syms.size() && skip(elf_syms[i].st_type))
+    while (i < elf_syms->size() && skip((*elf_syms)[i].st_type))
       i++;
 
-    if (i < elf_syms.size() && elf_syms[i].st_shndx == SHN_COMMON) {
-      std::string_view name =
-        data + shdrs[sec.sh_link].sh_offset + elf_syms[i].st_name;
-      if (name.starts_with("__gnu_lto_"))
+    if (i < elf_syms->size() && (*elf_syms)[i].st_shndx == SHN_COMMON) {
+      if (sec.sh_link >= shdrs->size())
+        return false;
+
+      std::optional<std::string_view> strtab =
+        get_elf_data(data, (*shdrs)[sec.sh_link].sh_offset,
+                     (*shdrs)[sec.sh_link].sh_size);
+      if (!strtab)
+        return false;
+
+      std::optional<std::string_view> name =
+        get_elf_string(*strtab, (*elf_syms)[i].st_name);
+      if (!name)
+        return false;
+      if (name->starts_with("__gnu_lto_"))
         return true;
     }
     break;
@@ -95,6 +178,9 @@ FileType get_file_type(Context &ctx, MappedFile *mf) {
     return FileType::EMPTY;
 
   if (data.starts_with("\177ELF")) {
+    if (data.size() < sizeof(ElfEhdr<I386>))
+      Fatal(ctx) << mf->name << ": file too small";
+
     u8 byte_order = ((ElfEhdr<I386> *)data.data())->e_ident[EI_DATA];
 
     if (byte_order == ELFDATA2LSB) {

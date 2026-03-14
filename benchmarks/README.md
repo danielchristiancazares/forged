@@ -33,9 +33,22 @@ the Mach-O entrypoint is selected.
 Use `--target <name>` to run only a subset of the corpus during bring-up or
 scanning.
 
+Use `--collect-sold-perf` to run one extra sold-only replay per target with
+`-perf -stats`. That extra replay is stored separately from the measured
+benchmark runs so it does not affect the Apple-vs-sold median wall-time
+comparison.
+
 Results are written to `benchmarks/out/results.json`. Per-target captures,
 derived commands, replay logs, and binaries are written under
 `benchmarks/out/targets/`.
+
+When `--collect-sold-perf` is enabled, sold results in `results.json` also
+include:
+
+- `perf_archive_fallbacks`: eager fallback archives with a machine-readable reason and path
+- `perf_counters`: parsed `-stats` `name=value` counters
+- `perf_timers`: parsed `-perf` timer rows with nesting depth
+- `perf_timer_totals_real_s`: per-name sums of timer real time across repeated rows
 
 ## Manifest format
 

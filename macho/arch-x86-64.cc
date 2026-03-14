@@ -114,24 +114,21 @@ static i64 read_addend(u8 *buf, const MachRel &r) {
 template <>
 std::vector<Relocation<E>>
 read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr) {
-  std::vector<Relocation<E>> vec;
-  vec.reserve(hdr.nreloc);
+  std::vector<Relocation<E>> vec(hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
+  u8 *contents = file.mf->data + hdr.offset;
+  Subsection<E> *last_target = nullptr;
 
-  for (i64 i = 0; i < hdr.nreloc; i++) {
-    MachRel &r = rels[i];
-    i64 addend = read_addend(file.mf->data + hdr.offset, r) +
-                 get_reloc_addend(r.type);
+  auto fill = [&](Relocation<E> &rel, MachRel &r, i64 idx) {
+    i64 addend = read_addend(contents, r) + get_reloc_addend(r.type);
 
-    vec.push_back(Relocation<E>{
+    rel = Relocation<E>{
       .offset = r.offset,
       .type = (u8)r.type,
       .size = (u8)(1 << r.p2size),
-      .is_subtracted = (i > 0 && rels[i - 1].type == X86_64_RELOC_SUBTRACTOR),
-    });
-
-    Relocation<E> &rel = vec.back();
+      .is_subtracted = (idx > 0 && rels[idx - 1].type == X86_64_RELOC_SUBTRACTOR),
+    };
 
     if (r.is_extern) {
       rel.target = file.syms[r.idx];
@@ -139,7 +136,17 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr
       rel.addend = addend;
     } else {
       u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend + 4) : addend;
-      Subsection<E> *target = file.find_subsection(ctx, addr);
+      Subsection<E> *target = nullptr;
+
+      if (last_target &&
+          last_target->input_addr <= addr &&
+          addr < (u64)last_target->input_addr + last_target->input_size) {
+        target = last_target;
+      } else {
+        target = file.find_subsection(ctx, addr);
+        last_target = target;
+      }
+
       if (!target)
         Fatal(ctx) << file << ": bad relocation: " << r.offset;
 
@@ -147,6 +154,35 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr
       rel.is_sym = false;
       rel.addend = addr - target->input_addr;
     }
+  };
+
+  bool reverse_sorted = true;
+  for (i64 i = 1; i < hdr.nreloc; i++) {
+    if (rels[i - 1].offset < rels[i].offset) {
+      reverse_sorted = false;
+      break;
+    }
+  }
+
+  if (reverse_sorted) {
+    i64 out = 0;
+
+    for (i64 i = hdr.nreloc; i > 0;) {
+      i64 j = i - 1;
+      u32 offset = rels[j].offset;
+
+      while (j > 0 && rels[j - 1].offset == offset)
+        j--;
+
+      for (i64 k = j; k < i; k++)
+        fill(vec[out++], rels[k], k);
+      i = j;
+    }
+
+    ASSERT(out == hdr.nreloc);
+  } else {
+    for (i64 i = 0; i < hdr.nreloc; i++)
+      fill(vec[i], rels[i], i);
   }
 
   return vec;

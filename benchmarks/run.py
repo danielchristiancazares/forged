@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shlex
 import statistics
 import subprocess
@@ -26,6 +27,10 @@ SIDE_OUTPUT_FLAGS = {
 
 SMOKE_TIMEOUT_S = 30
 OUTPUT_WAIT_TIMEOUT_S = 5
+PERF_TIMER_HEADER = "User   System     Real  Name"
+PERF_TIMER_RE = re.compile(r"^\s*([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+)\s{2}( *)(\S.*)$")
+PERF_COUNTER_RE = re.compile(r"^\s*([A-Za-z0-9_]+)=(-?\d+)$")
+PERF_ARCHIVE_FALLBACK_RE = re.compile(r"^archive_fallback=([A-Za-z0-9_]+)\t(.+)$")
 
 
 @dataclass
@@ -261,6 +266,68 @@ def parse_time_output(stderr: str) -> float:
     raise RuntimeError(f"failed to parse /usr/bin/time -lp output:\n{stderr}")
 
 
+def parse_perf_timers(stdout: str) -> tuple[list[dict[str, object]], dict[str, float]]:
+    rows: list[dict[str, object]] = []
+    totals: dict[str, float] = {}
+    in_table = False
+
+    for line in stdout.splitlines():
+        if line.strip() == PERF_TIMER_HEADER:
+            in_table = True
+            continue
+
+        if not in_table:
+            continue
+
+        match = PERF_TIMER_RE.match(line)
+        if not match:
+            continue
+
+        user_s = float(match.group(1))
+        sys_s = float(match.group(2))
+        real_s = float(match.group(3))
+        indent = match.group(4)
+        name = match.group(5)
+        depth = len(indent) // 2
+
+        rows.append(
+            {
+                "name": name,
+                "depth": depth,
+                "user_s": user_s,
+                "sys_s": sys_s,
+                "real_s": real_s,
+            }
+        )
+        totals[name] = totals.get(name, 0.0) + real_s
+
+    return rows, totals
+
+
+def parse_perf_counters(stdout: str) -> dict[str, int]:
+    counters: dict[str, int] = {}
+
+    for line in stdout.splitlines():
+        match = PERF_COUNTER_RE.match(line)
+        if not match:
+            continue
+        counters[match.group(1)] = int(match.group(2))
+
+    return counters
+
+
+def parse_perf_archive_fallbacks(stdout: str) -> list[dict[str, str]]:
+    fallbacks: list[dict[str, str]] = []
+
+    for line in stdout.splitlines():
+        match = PERF_ARCHIVE_FALLBACK_RE.match(line)
+        if not match:
+            continue
+        fallbacks.append({"reason": match.group(1), "path": match.group(2)})
+
+    return fallbacks
+
+
 def timed_run(cmd: list[str], cwd: pathlib.Path) -> tuple[subprocess.CompletedProcess[str], float]:
     completed = subprocess.run(
         ["/usr/bin/time", "-lp", *cmd],
@@ -409,6 +476,55 @@ def benchmark_linker(
     }
 
 
+def collect_linker_perf(
+    name: str,
+    argv: list[str],
+    replay_cwd: pathlib.Path,
+    target: TargetConfig,
+    target_out_dir: pathlib.Path,
+) -> dict[str, object]:
+    perf_argv = [argv[0], "-perf", "-stats", *argv[1:]]
+    rewritten_argv, binary_path = rewrite_output_paths(perf_argv, target_out_dir, f"{name}_perf")
+    log_dir = target_out_dir / f"{name}_perf" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if binary_path.exists():
+        binary_path.unlink()
+
+    completed, wall_s = timed_run(rewritten_argv, replay_cwd)
+    log_prefix = log_dir / "perf-01"
+    (log_prefix.with_suffix(".stdout.log")).write_text(completed.stdout)
+    (log_prefix.with_suffix(".stderr.log")).write_text(completed.stderr)
+
+    if completed.returncode != 0:
+        raise RuntimeError(f"{name} perf replay failed for target {target.name}")
+
+    wait_for_output_file(binary_path)
+    binary_checks = verify_binary(binary_path)
+    smoke_pass, smoke_exit_status = run_smoke(target, binary_path)
+    if not binary_checks["mach_o_pass"] or not binary_checks["otool_pass"] or not smoke_pass:
+        raise RuntimeError(f"{name} perf replay validation failed for target {target.name}")
+
+    perf_timers, perf_timer_totals = parse_perf_timers(completed.stdout)
+    perf_counters = parse_perf_counters(completed.stdout)
+    perf_archive_fallbacks = parse_perf_archive_fallbacks(completed.stdout)
+
+    if not perf_timers:
+        raise RuntimeError(f"{name} perf replay did not emit timer output for target {target.name}")
+
+    return {
+        "perf_archive_fallbacks": perf_archive_fallbacks,
+        "perf_binary_checks": binary_checks,
+        "perf_binary_path": str(binary_path),
+        "perf_counters": perf_counters,
+        "perf_smoke_exit_status": smoke_exit_status,
+        "perf_smoke_pass": smoke_pass,
+        "perf_timers": perf_timers,
+        "perf_timer_totals_real_s": perf_timer_totals,
+        "perf_wall_s": wall_s,
+    }
+
+
 def ensure_supported_host() -> None:
     if platform.system() != "Darwin":
         raise RuntimeError("this benchmark harness only supports macOS")
@@ -433,6 +549,13 @@ def main() -> int:
     parser.add_argument("--warmups", type=int, default=1, help="Number of warmup runs per linker")
     parser.add_argument("--runs", type=int, default=10, help="Number of measured runs per linker")
     parser.add_argument("--min-win-pct", type=float, default=10.0, help="Required sold median win percentage")
+    parser.add_argument(
+        "--collect-sold-perf",
+        dest="collect_sold_perf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run one extra sold replay with -perf -stats and store parsed metrics",
+    )
     parser.add_argument(
         "--cargo-clean",
         dest="cargo_clean",
@@ -511,6 +634,16 @@ def main() -> int:
             warmups=args.warmups,
             runs=args.runs,
         )
+        if args.collect_sold_perf:
+            sold_result.update(
+                collect_linker_perf(
+                    name="sold",
+                    argv=sold_argv,
+                    replay_cwd=replay_cwd,
+                    target=target,
+                    target_out_dir=target_dir,
+                )
+            )
 
         results.extend([apple_result, sold_result])
 

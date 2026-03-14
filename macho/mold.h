@@ -21,6 +21,8 @@
 namespace mold::macho {
 
 template <typename E> class Chunk;
+template <typename E> struct ArchiveFile;
+template <typename E> struct ArchiveMember;
 template <typename E> class InputSection;
 template <typename E> class ObjectFile;
 template <typename E> class OutputSection;
@@ -175,6 +177,8 @@ public:
   static ObjectFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                             std::string archive_name);
   void parse(Context<E> &ctx);
+  void finish_parse(Context<E> &ctx);
+  bool needs_finish_parse() const;
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
   std::vector<std::string> get_linker_options(Context<E> &ctx);
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
@@ -224,6 +228,7 @@ private:
   void split_cstring_literals(Context<E> &ctx);
   void split_fixed_size_literals(Context<E> &ctx);
   void split_literal_pointers(Context<E> &ctx);
+  void build_subsection_lookup();
   InputSection<E> *get_common_sec(Context<E> &ctx);
   void parse_lto_symbols(Context<E> &ctx);
 
@@ -235,7 +240,12 @@ private:
   std::unique_ptr<MachSection<E>> common_hdr;
   InputSection<E> *common_sec = nullptr;
   bool has_debug_info = false;
+  bool fully_parsed = false;
 
+  static constexpr u32 SUBSECTION_LOOKUP_SHIFT = 8;
+  static constexpr u32 NO_SUBSECTION = -1;
+
+  std::vector<u32> subsection_lookup;
   std::vector<std::unique_ptr<Subsection<E>>> subsec_pool;
   std::vector<std::unique_ptr<MachSection<E>>> mach_sec_pool;
 };
@@ -1023,6 +1033,9 @@ void load_lto_plugin(Context<E> &ctx);
 template <typename E>
 void do_lto(Context<E> &ctx);
 
+template <typename E>
+void maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym);
+
 //
 // arch-arm64.cc
 //
@@ -1060,6 +1073,38 @@ struct ReaderContext {
   bool weak = false;
   bool reexport = false;
   bool implicit = false;
+};
+
+struct StringViewHash {
+  size_t operator()(std::string_view str) const {
+    return hash_string(str);
+  }
+};
+
+struct StringViewEq {
+  bool operator()(std::string_view a, std::string_view b) const {
+    return a == b;
+  }
+};
+
+template <typename E>
+struct ArchiveMember {
+  ArchiveFile<E> *archive = nullptr;
+  ObjectFile<E> *file = nullptr;
+  std::string name;
+  std::string path;
+  u64 data_offset = 0;
+  u64 data_size = 0;
+  i64 priority = 0;
+  bool is_thin = false;
+  bool is_loaded = false;
+};
+
+template <typename E>
+struct ArchiveFile {
+  MappedFile<Context<E>> *mf = nullptr;
+  ReaderContext reader;
+  std::vector<ArchiveMember<E>> members;
 };
 
 template <typename E>
@@ -1174,7 +1219,8 @@ struct Context {
   std::vector<std::string_view> cmdline_args;
   tbb::task_group tg;
   u32 output_type = MH_EXECUTE;
-  i64 file_priority = 10000;
+  i64 next_object_priority = 10000;
+  i64 next_dylib_priority = 8'000'000;
   std::set<std::string> missing_files; // for -dependency_info
 
   u8 uuid[16] = {};
@@ -1192,6 +1238,7 @@ struct Context {
   bool overwrite_output_file = false;
 
   tbb::concurrent_vector<std::unique_ptr<ObjectFile<E>>> obj_pool;
+  tbb::concurrent_vector<std::unique_ptr<ArchiveFile<E>>> archive_pool;
   tbb::concurrent_vector<std::unique_ptr<DylibFile<E>>> dylib_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
   tbb::concurrent_vector<std::unique_ptr<MappedFile<Context<E>>>> mf_pool;
@@ -1200,8 +1247,21 @@ struct Context {
   tbb::concurrent_vector<std::unique_ptr<TimerRecord>> timer_records;
 
   std::vector<ObjectFile<E> *> objs;
+  std::vector<ArchiveFile<E> *> archives;
   std::vector<DylibFile<E> *> dylibs;
   ObjectFile<E> *internal_obj = nullptr;
+  std::unordered_set<std::string> seen_frameworks;
+  std::unordered_set<std::string> seen_libraries;
+  std::unordered_map<std::string, DylibFile<E> *> framework_dylibs;
+  std::unordered_map<std::string, DylibFile<E> *> lib_dylibs;
+  std::unordered_map<std::string_view, std::vector<ArchiveMember<E> *>,
+                     StringViewHash, StringViewEq> archive_symbol_map;
+  std::vector<std::string> archive_fallbacks;
+  std::mutex input_path_cache_mu;
+  std::unordered_map<std::string, MappedFile<Context<E>> *> input_path_cache;
+  std::unordered_set<std::string> missing_input_paths;
+  std::mutex framework_realpath_cache_mu;
+  std::unordered_map<std::string, std::string> framework_realpath_cache;
 
   OutputSegment<E> *text_seg = nullptr;
   OutputSegment<E> *data_const_seg = nullptr;
@@ -1249,6 +1309,83 @@ struct Context {
   Symbol<E> *__mh_bundle_header = nullptr;
   Symbol<E> *___dso_handle = nullptr;
 };
+
+template <typename E>
+MappedFile<Context<E>> *open_cached_input(Context<E> &ctx, std::string path,
+                                          bool record_missing = false) {
+  static Counter hits("num_cached_input_path_hits");
+  static Counter misses("num_cached_input_path_misses");
+
+  {
+    std::scoped_lock lock(ctx.input_path_cache_mu);
+
+    if (auto it = ctx.input_path_cache.find(path); it != ctx.input_path_cache.end()) {
+      hits++;
+      return it->second;
+    }
+
+    if (ctx.missing_input_paths.contains(path)) {
+      hits++;
+      if (record_missing)
+        ctx.missing_files.insert(path);
+      return nullptr;
+    }
+  }
+
+  misses++;
+  MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
+
+  {
+    std::scoped_lock lock(ctx.input_path_cache_mu);
+
+    if (mf) {
+      if (auto it = ctx.input_path_cache.find(path); it != ctx.input_path_cache.end()) {
+        hits++;
+        return it->second;
+      }
+      ctx.input_path_cache.emplace(path, mf);
+    } else {
+      ctx.missing_input_paths.insert(path);
+    }
+  }
+
+  if (!mf && record_missing)
+    ctx.missing_files.insert(path);
+  return mf;
+}
+
+template <typename E>
+std::string resolve_framework_realpath(Context<E> &ctx, std::string path) {
+  Timer t(ctx, "resolve_framework_realpath");
+  static Counter hits("num_framework_realpath_hits");
+  static Counter misses("num_framework_realpath_misses");
+
+  {
+    std::scoped_lock lock(ctx.framework_realpath_cache_mu);
+
+    if (auto it = ctx.framework_realpath_cache.find(path);
+        it != ctx.framework_realpath_cache.end()) {
+      hits++;
+      return it->second;
+    }
+  }
+
+  misses++;
+  std::string resolved = get_realpath(path);
+
+  {
+    std::scoped_lock lock(ctx.framework_realpath_cache_mu);
+
+    if (auto it = ctx.framework_realpath_cache.find(path);
+        it != ctx.framework_realpath_cache.end()) {
+      hits++;
+      return it->second;
+    }
+    ctx.framework_realpath_cache.emplace(path, resolved);
+  }
+
+  return resolved;
+}
 
 template <typename E>
 int macho_main(int argc, char **argv);

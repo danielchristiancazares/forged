@@ -2,6 +2,41 @@
 
 namespace mold::macho {
 
+template <typename T>
+static void sort_relocations_by_offset(std::vector<T> &vec) {
+  if (vec.size() < 2)
+    return;
+
+  auto less = [](const T &a, const T &b) { return a.offset < b.offset; };
+  if (std::is_sorted(vec.begin(), vec.end(), less))
+    return;
+
+  bool reverse_sorted = true;
+  for (i64 i = 1; i < vec.size(); i++) {
+    if (vec[i - 1].offset < vec[i].offset) {
+      reverse_sorted = false;
+      break;
+    }
+  }
+
+  if (reverse_sorted) {
+    std::reverse(vec.begin(), vec.end());
+
+    // Preserve original order for relocations that share the same offset,
+    // such as SUBTRACTOR/UNSIGNED pairs.
+    for (i64 i = 0; i < vec.size();) {
+      i64 j = i + 1;
+      while (j < vec.size() && vec[i].offset == vec[j].offset)
+        j++;
+      std::reverse(vec.begin() + i, vec.begin() + j);
+      i = j;
+    }
+    return;
+  }
+
+  std::stable_sort(vec.begin(), vec.end(), less);
+}
+
 template <typename E>
 OutputSection<E> &get_output_section(Context<E> &ctx, const MachSection<E> &hdr) {
   static std::unordered_set<std::string_view> data_const_set = {
@@ -32,13 +67,17 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
 
 template <typename E>
 void InputSection<E>::parse_relocations(Context<E> &ctx) {
-  // Parse mach-o relocations to fill `rels` vector
-  rels = read_relocations(ctx, file, hdr);
+  Timer timer(ctx, "parse_relocations_section");
 
-  // Sort `rels` vector
-  sort(rels, [](const Relocation<E> &a, const Relocation<E> &b) {
-    return a.offset < b.offset;
-  });
+  {
+    Timer t(ctx, "read_relocations_section", &timer);
+    rels = read_relocations(ctx, file, hdr);
+  }
+
+  {
+    Timer t(ctx, "sort_relocations_section", &timer);
+    sort_relocations_by_offset(rels);
+  }
 
   // Find subsections this relocation section refers to
   auto begin = std::partition_point(file.subsections.begin(),
@@ -48,22 +87,26 @@ void InputSection<E>::parse_relocations(Context<E> &ctx) {
   });
 
   auto end = std::partition_point(begin, file.subsections.end(),
-                                  [&](Subsection<E> *subsec) {
+                                    [&](Subsection<E> *subsec) {
     return subsec->input_addr < hdr.addr + hdr.size;
   });
 
-  // Assign each subsection a group of relocations
-  i64 i = 0;
-  for (auto it = begin; it < end; it++) {
-    Subsection<E> &subsec = **it;
-    subsec.rel_offset = i;
+  {
+    Timer t(ctx, "assign_relocations_section", &timer);
 
-    u32 input_offset = subsec.input_addr - subsec.isec->hdr.addr;
-    while (i < rels.size() && rels[i].offset < input_offset + subsec.input_size) {
-      rels[i].offset -= input_offset;
-      i++;
+    // Assign each subsection a group of relocations
+    i64 i = 0;
+    for (auto it = begin; it < end; it++) {
+      Subsection<E> &subsec = **it;
+      subsec.rel_offset = i;
+
+      u32 input_offset = subsec.input_addr - subsec.isec->hdr.addr;
+      while (i < rels.size() && rels[i].offset < input_offset + subsec.input_size) {
+        rels[i].offset -= input_offset;
+        i++;
+      }
+      subsec.nrels = i - subsec.rel_offset;
     }
-    subsec.nrels = i - subsec.rel_offset;
   }
 }
 

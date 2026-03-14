@@ -52,10 +52,14 @@ static void resolve_symbols(Context<E> &ctx) {
 
   auto mark_live_objects = [&] {
     // We want to keep symbols that may be referenced indirectly.
-    for (std::string_view name : ctx.arg.u)
-      if (InputFile<E> *file = get_symbol(ctx, name)->file)
+    for (std::string_view name : ctx.arg.u) {
+      Symbol<E> *sym = get_symbol(ctx, name);
+      maybe_extract_archive_member(ctx, *sym);
+      if (InputFile<E> *file = sym->file)
         file->is_alive = true;
+    }
 
+    maybe_extract_archive_member(ctx, *ctx.arg.entry);
     if (InputFile<E> *file = ctx.arg.entry->file)
       file->is_alive = true;
 
@@ -87,6 +91,10 @@ static void resolve_symbols(Context<E> &ctx) {
     do_lto(ctx);
     mark_live_objects();
   }
+
+  files.clear();
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
 
   // Remove symbols of eliminated files.
   tbb::parallel_for_each(files, [&](InputFile<E> *file) {
@@ -472,6 +480,19 @@ static void claim_unresolved_symbols(Context<E> &ctx) {
   std::vector<Symbol<E> *> other_syms2 = flatten(other_syms);
   tbb::parallel_sort(other_syms2.begin(), other_syms2.end(), less);
   append(ctx.internal_obj->syms, other_syms2);
+}
+
+template <typename E>
+static void finish_parsing_archive_members(Context<E> &ctx) {
+  Timer t(ctx, "finish_parsing_archive_members");
+  static Counter counter("num_archive_members_finish_parsed");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file->needs_finish_parse()) {
+      counter++;
+      file->finish_parse(ctx);
+    }
+  });
 }
 
 template <typename E>
@@ -928,6 +949,345 @@ strip_universal_header(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
+static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf);
+
+template <typename E>
+static void collect_hoisted_dylibs(Context<E> &ctx) {
+  std::unordered_set<std::string_view> seen;
+  for (DylibFile<E> *file : ctx.dylibs)
+    if (!file->install_name.empty())
+      seen.insert(file->install_name);
+
+  for (i64 i = 0; i < ctx.dylibs.size(); i++)
+    for (DylibFile<E> *file : ctx.dylibs[i]->hoisted_libs)
+      if (seen.insert(file->install_name).second)
+        ctx.dylibs.push_back(file);
+}
+
+template <typename E>
+static void resolve_new_files(Context<E> &ctx, i64 obj_begin, i64 dylib_begin) {
+  ctx.tg.wait();
+  collect_hoisted_dylibs(ctx);
+
+  for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
+    ctx.dylibs[i]->resolve_symbols(ctx);
+
+  for (i64 i = obj_begin; i < ctx.objs.size(); i++)
+    ctx.objs[i]->resolve_symbols(ctx);
+}
+
+template <typename E>
+static MappedFile<Context<E>> *
+search_library(Context<E> &ctx, std::string_view name,
+               std::initializer_list<std::string_view> suffixes) {
+  Timer t(ctx, "search_library");
+
+  for (const std::string &dir : ctx.arg.library_paths) {
+    std::string path = dir + "/lib";
+    path += name;
+
+    i64 base = path.size();
+    for (std::string_view suffix : suffixes) {
+      path.resize(base);
+      path += suffix;
+      if (MappedFile<Context<E>> *mf = open_cached_input(ctx, path, true))
+        return mf;
+    }
+  }
+  return nullptr;
+}
+
+template <typename E>
+static MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
+  if (ctx.arg.search_paths_first)
+    return search_library(ctx, name, {".tbd", ".dylib", ".a"});
+
+  if (MappedFile<Context<E>> *mf =
+        search_library(ctx, name, {".tbd", ".dylib"}))
+    return mf;
+  return search_library(ctx, name, {".a"});
+}
+
+template <typename E>
+static MappedFile<Context<E>> *find_framework(Context<E> &ctx, std::string name) {
+  Timer t(ctx, "find_framework");
+  std::string suffix;
+  std::tie(name, suffix) = split_string(name, ',');
+
+  for (const std::string &root : ctx.arg.framework_paths) {
+    std::string path =
+      resolve_framework_realpath(ctx, root + "/" + name + ".framework/" + name);
+
+    if (!suffix.empty())
+      if (MappedFile<Context<E>> *mf = open_cached_input(ctx, path + suffix))
+        return mf;
+
+    if (MappedFile<Context<E>> *mf = open_cached_input(ctx, path + ".tbd"))
+      return mf;
+
+    if (MappedFile<Context<E>> *mf = open_cached_input(ctx, path))
+      return mf;
+  }
+  return nullptr;
+}
+
+template <typename E>
+static bool read_library(Context<E> &ctx, std::string name, bool required = true) {
+  if (ctx.seen_libraries.contains(name)) {
+    if (ctx.reader.needed)
+      if (auto it = ctx.lib_dylibs.find(name); it != ctx.lib_dylibs.end())
+        it->second->is_alive = true;
+    return true;
+  }
+
+  MappedFile<Context<E>> *mf = find_library(ctx, name);
+  if (!mf) {
+    if (required)
+      Fatal(ctx) << "library not found: -l" << name;
+    return false;
+  }
+
+  ctx.seen_libraries.insert(name);
+  i64 num_dylibs = ctx.dylibs.size();
+  read_file(ctx, mf);
+
+  if (ctx.dylibs.size() != num_dylibs)
+    ctx.lib_dylibs.emplace(name, ctx.dylibs.back());
+  return true;
+}
+
+template <typename E>
+static bool read_framework(Context<E> &ctx, std::string name,
+                           bool required = true) {
+  if (ctx.seen_frameworks.contains(name)) {
+    if (ctx.reader.needed)
+      if (auto it = ctx.framework_dylibs.find(name);
+          it != ctx.framework_dylibs.end())
+        it->second->is_alive = true;
+    return true;
+  }
+
+  MappedFile<Context<E>> *mf = find_framework(ctx, name);
+  if (!mf) {
+    if (required)
+      Fatal(ctx) << "-framework not found: " << name;
+    return false;
+  }
+
+  ctx.seen_frameworks.insert(name);
+  i64 num_dylibs = ctx.dylibs.size();
+  read_file(ctx, mf);
+
+  if (ctx.dylibs.size() != num_dylibs)
+    ctx.framework_dylibs.emplace(name, ctx.dylibs.back());
+  return true;
+}
+
+template <typename E>
+static void read_bundle(Context<E> &ctx, std::string name) {
+  MappedFile<Context<E>> *mf = open_cached_input(ctx, name);
+  if (!mf)
+    Fatal(ctx) << "-bundle_loader: cannot open " << name;
+  read_file(ctx, mf);
+}
+
+template <typename E>
+static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
+  std::vector<std::string> opts = file.get_linker_options(ctx);
+  ReaderContext orig = ctx.reader;
+
+  auto warn_bad_linker_option = [&](std::string_view opt) {
+    Warn(ctx) << file << ": ignoring unsupported LC_LINKER_OPTION command: " << opt;
+  };
+
+  auto warn_malformed_linker_option = [&](std::string_view opt) {
+    Warn(ctx) << file << ": ignoring malformed LC_LINKER_OPTION command: " << opt;
+  };
+
+  for (i64 j = 0; j < opts.size();) {
+    ctx.reader = orig;
+    ctx.reader.implicit = true;
+
+    std::string_view opt = opts[j];
+
+    if (opt == "-framework" || opt == "-needed_framework" ||
+        opt == "-needed-framework") {
+      if (j + 1 >= opts.size()) {
+        warn_malformed_linker_option(opt);
+        j++;
+        continue;
+      }
+
+      if (opt != "-framework")
+        ctx.reader.needed = true;
+
+      read_framework(ctx, opts[j + 1], false);
+      j += 2;
+      continue;
+    }
+
+    if (opt == "-needed-l" || opt == "-l") {
+      if (j + 1 >= opts.size()) {
+        warn_malformed_linker_option(opt);
+        j++;
+        continue;
+      }
+
+      if (opt == "-needed-l")
+        ctx.reader.needed = true;
+
+      read_library(ctx, opts[j + 1], false);
+      j += 2;
+      continue;
+    }
+
+    if (opt.starts_with("-needed-l")) {
+      if (opt.size() == std::string_view("-needed-l").size()) {
+        warn_malformed_linker_option(opt);
+        j++;
+        continue;
+      }
+
+      ctx.reader.needed = true;
+      read_library(ctx, std::string(opt.substr(std::string_view("-needed-l").size())),
+                   false);
+      j++;
+      continue;
+    }
+
+    if (opt.starts_with("-l")) {
+      if (opt.size() == std::string_view("-l").size()) {
+        warn_malformed_linker_option(opt);
+        j++;
+        continue;
+      }
+
+      read_library(ctx, std::string(opt.substr(2)), false);
+      j++;
+      continue;
+    }
+
+    warn_bad_linker_option(opt);
+    j++;
+  }
+
+  ctx.reader = orig;
+}
+
+template <typename E>
+static ObjectFile<E> *load_archive_member(Context<E> &ctx,
+                                          ArchiveMember<E> &member) {
+  if (member.is_loaded)
+    return member.file;
+
+  static Counter counter("num_archive_members_extracted");
+  member.is_loaded = true;
+
+  MappedFile<Context<E>> *mf;
+  if (member.is_thin) {
+    mf = MappedFile<Context<E>>::must_open(ctx, member.path);
+    mf->thin_parent = member.archive->mf;
+  } else {
+    mf = member.archive->mf->slice(ctx, member.name, member.data_offset,
+                                   member.data_size);
+  }
+
+  if (get_file_type(ctx, mf) == FileType::MACH_UNIVERSAL)
+    mf = strip_universal_header(ctx, mf);
+
+  FileType type = get_file_type(ctx, mf);
+  if (type != FileType::MACH_OBJ && type != FileType::LLVM_BITCODE)
+    return nullptr;
+
+  ReaderContext saved = ctx.reader;
+  ctx.reader = member.archive->reader;
+  ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, member.archive->mf->name);
+  ctx.reader = saved;
+
+  counter++;
+  file->priority = member.priority;
+  member.file = file;
+  ctx.objs.push_back(file);
+  file->parse(ctx);
+  return file;
+}
+
+template <typename E>
+static void record_archive_fallback(Context<E> &ctx, MappedFile<Context<E>> *mf,
+                                    ArchiveIndexStatus status) {
+  static Counter counter("num_archives_eager_fallback");
+  static Counter no_symtab("num_archives_eager_fallback_no_darwin_symtab");
+  static Counter empty_symtab("num_archives_eager_fallback_empty_darwin_symtab");
+
+  counter++;
+
+  switch (status) {
+  case ArchiveIndexStatus::OK:
+    unreachable();
+  case ArchiveIndexStatus::NO_DARWIN_SYMTAB:
+    no_symtab++;
+    break;
+  case ArchiveIndexStatus::EMPTY_DARWIN_SYMTAB:
+    empty_symtab++;
+    break;
+  }
+
+  ctx.archive_fallbacks.push_back(std::string(archive_index_status_name(status)) +
+                                  "\t" + mf->name);
+}
+
+template <typename E>
+static ArchiveIndexStatus add_archive(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  Timer t(ctx, "index_archive");
+  ArchiveReadResult<Context<E>, MappedFile<Context<E>>> result =
+    read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+  if (!result.info)
+    return result.status;
+  ArchiveFileInfo<Context<E>, MappedFile<Context<E>>> &info = *result.info;
+
+  static Counter archives("num_archives_indexed");
+  static Counter empty_symtab("num_archives_indexed_empty_darwin_symtab");
+  static Counter members("num_archive_members_indexed");
+  static Counter symbols("num_archive_symbols_indexed");
+  archives++;
+  if (result.status == ArchiveIndexStatus::EMPTY_DARWIN_SYMTAB) {
+    empty_symtab++;
+    // A Darwin archive with an empty TOC can't satisfy symbol-driven extraction
+    // in the lazy path, so avoid building per-member bookkeeping for it.
+    return ArchiveIndexStatus::OK;
+  }
+  members += (int)info.members.size();
+  symbols += (int)info.symbols.size();
+
+  std::unique_ptr<ArchiveFile<E>> archive = std::make_unique<ArchiveFile<E>>();
+  archive->mf = mf;
+  archive->reader = ctx.reader;
+  archive->members.reserve(info.members.size());
+
+  for (auto &src : info.members) {
+    ArchiveMember<E> &dst = archive->members.emplace_back();
+    dst.archive = archive.get();
+    dst.name = std::move(src.name);
+    dst.path = std::move(src.path);
+    dst.data_offset = src.data_offset;
+    dst.data_size = src.data_size;
+    dst.priority = ctx.next_object_priority++;
+    dst.is_thin = src.is_thin;
+  }
+
+  ArchiveFile<E> *archive_ptr = archive.get();
+  for (ArchiveSymbolInfo ent : info.symbols) {
+    ASSERT(ent.member_idx >= 0);
+    ASSERT((size_t)ent.member_idx < archive->members.size());
+    ctx.archive_symbol_map[ent.name].push_back(&archive->members[ent.member_idx]);
+  }
+
+  ctx.archive_pool.emplace_back(std::move(archive));
+  ctx.archives.push_back(archive_ptr);
+  return ArchiveIndexStatus::OK;
+}
+
+template <typename E>
 static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (get_file_type(ctx, mf) == FileType::MACH_UNIVERSAL)
     mf = strip_universal_header(ctx, mf);
@@ -944,15 +1304,25 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   case FileType::MACH_OBJ:
   case FileType::LLVM_BITCODE: {
     ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, "");
+    file->priority = ctx.next_object_priority++;
     ctx.tg.run([file, &ctx] { file->parse(ctx); });
     ctx.objs.push_back(file);
     break;
   }
   case FileType::AR:
+  case FileType::THIN_AR:
+    if (!ctx.arg.ObjC && !ctx.reader.all_load) {
+      ArchiveIndexStatus status = add_archive(ctx, mf);
+      if (status == ArchiveIndexStatus::OK)
+        break;
+      record_archive_fallback(ctx, mf, status);
+    }
+
     for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
       FileType type = get_file_type(ctx, child);
       if (type == FileType::MACH_OBJ || type == FileType::LLVM_BITCODE) {
         ObjectFile<E> *file = ObjectFile<E>::create(ctx, child, mf->name);
+        file->priority = ctx.next_object_priority++;
         ctx.tg.run([file, &ctx] { file->parse(ctx); });
         ctx.objs.push_back(file);
       }
@@ -991,109 +1361,8 @@ read_filelist(Context<E> &ctx, std::string arg) {
 }
 
 template <typename E>
-static bool has_dylib(Context<E> &ctx, std::string_view path) {
-  for (DylibFile<E> *file : ctx.dylibs)
-    if (file->install_name == path)
-      return true;
-  return false;
-}
-
-template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
-
-  std::unordered_set<std::string> libs;
-  std::unordered_set<std::string> frameworks;
-  std::unordered_map<std::string, DylibFile<E> *> lib_dylibs;
-  std::unordered_map<std::string, DylibFile<E> *> framework_dylibs;
-
-  auto search = [&](std::vector<std::string> names) -> MappedFile<Context<E>> * {
-    for (std::string dir : ctx.arg.library_paths) {
-      for (std::string name : names) {
-        std::string path = dir + "/lib" + name;
-        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
-          return mf;
-        ctx.missing_files.insert(path);
-      }
-    }
-    return nullptr;
-  };
-
-  auto find_library = [&](std::string name) -> MappedFile<Context<E>> * {
-    // -search_paths_first
-    if (ctx.arg.search_paths_first)
-      return search({name + ".tbd", name + ".dylib", name + ".a"});
-
-    // -search_dylibs_first
-    if (MappedFile<Context<E>> *mf = search({name + ".tbd", name + ".dylib"}))
-      return mf;
-    return search({name + ".a"});
-  };
-
-  auto read_library = [&](std::string name) {
-    if (!libs.insert(name).second) {
-      if (ctx.reader.needed)
-        if (auto it = lib_dylibs.find(name); it != lib_dylibs.end())
-          it->second->is_alive = true;
-      return;
-    }
-
-    MappedFile<Context<E>> *mf = find_library(name);
-    if (!mf)
-      Fatal(ctx) << "library not found: -l" << name;
-
-    i64 num_dylibs = ctx.dylibs.size();
-    read_file(ctx, mf);
-
-    if (ctx.dylibs.size() != num_dylibs)
-      lib_dylibs.emplace(name, ctx.dylibs.back());
-  };
-
-  auto read_bundle = [&](std::string name) {
-    MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, name);
-    if (!mf)
-      Fatal(ctx) << "-bundle_loader: cannot open " << name;
-    read_file(ctx, mf);
-  };
-
-  auto find_framework = [&](std::string name) -> MappedFile<Context<E>> * {
-    std::string suffix;
-    std::tie(name, suffix) = split_string(name, ',');
-
-    for (std::string path : ctx.arg.framework_paths) {
-      path = get_realpath(path + "/" + name + ".framework/" + name);
-
-      if (!suffix.empty())
-        if (auto *mf = MappedFile<Context<E>>::open(ctx, path + suffix))
-          return mf;
-
-      if (auto *mf = MappedFile<Context<E>>::open(ctx, path + ".tbd"))
-        return mf;
-
-      if (auto *mf = MappedFile<Context<E>>::open(ctx, path))
-        return mf;
-    }
-    return nullptr;
-  };
-
-  auto read_framework = [&](std::string name) {
-    if (!frameworks.insert(name).second) {
-      if (ctx.reader.needed)
-        if (auto it = framework_dylibs.find(name); it != framework_dylibs.end())
-          it->second->is_alive = true;
-      return;
-    }
-
-    MappedFile<Context<E>> *mf = find_framework(name);
-    if (!mf)
-      Fatal(ctx) << "-framework not found: " << name;
-
-    i64 num_dylibs = ctx.dylibs.size();
-    read_file(ctx, mf);
-
-    if (ctx.dylibs.size() != num_dylibs)
-      framework_dylibs.emplace(name, ctx.dylibs.back());
-  };
 
   while (!args.empty()) {
     const std::string &opt = args[0];
@@ -1132,27 +1401,27 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       ctx.reader.all_load = true;
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
     } else if (opt == "-framework") {
-      read_framework(arg);
+      read_framework(ctx, arg);
     } else if (opt == "-needed_framework" || opt == "-needed-framework") {
       ctx.reader.needed = true;
-      read_framework(arg);
+      read_framework(ctx, arg);
     } else if (opt == "-weak_framework") {
       ctx.reader.weak = true;
-      read_framework(arg);
+      read_framework(ctx, arg);
     } else if (opt == "-l") {
-      read_library(arg);
+      read_library(ctx, arg);
     } else if (opt == "-needed-l") {
       ctx.reader.needed = true;
-      read_library(arg);
+      read_library(ctx, arg);
     } else if (opt == "-hidden-l") {
       ctx.reader.hidden = true;
-      read_library(arg);
+      read_library(ctx, arg);
     } else if (opt == "-weak-l") {
       ctx.reader.weak = true;
-      read_library(arg);
+      read_library(ctx, arg);
     } else if (opt == "-reexport-l") {
       ctx.reader.reexport = true;
-      read_library(arg);
+      read_library(ctx, arg);
     } else if (opt == "-reexport_library") {
       ctx.reader.reexport = true;
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
@@ -1165,170 +1434,64 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 
   // With -bundle_loader, we can import symbols from a main executable.
   if (!ctx.arg.bundle_loader.empty())
-    read_bundle(ctx.arg.bundle_loader);
+    read_bundle(ctx, ctx.arg.bundle_loader);
 
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any. We accept the common
   // autolink forms and warn for the rest instead of hard-failing.
   for (i64 i = 0; i < ctx.objs.size(); i++) {
-    ObjectFile<E> *file = ctx.objs[i];
-    std::vector<std::string> opts = file->get_linker_options(ctx);
-
-    ReaderContext orig = ctx.reader;
-
-    auto warn_bad_linker_option = [&](std::string_view opt) {
-      Warn(ctx) << *file << ": ignoring unsupported LC_LINKER_OPTION command: "
-                << opt;
-    };
-
-    auto warn_malformed_linker_option = [&](std::string_view opt) {
-      Warn(ctx) << *file << ": ignoring malformed LC_LINKER_OPTION command: "
-                << opt;
-    };
-
-    for (i64 j = 0; j < opts.size();) {
-      ctx.reader = orig;
-      ctx.reader.implicit = true;
-
-      std::string_view opt = opts[j];
-
-      if (opt == "-framework" || opt == "-needed_framework" ||
-          opt == "-needed-framework") {
-        if (j + 1 >= opts.size()) {
-          warn_malformed_linker_option(opt);
-          j++;
-          continue;
-        }
-
-        if (opt != "-framework")
-          ctx.reader.needed = true;
-
-        if (MappedFile<Context<E>> *mf = find_framework(opts[j + 1])) {
-          std::string name = opts[j + 1];
-
-          if (!frameworks.insert(name).second) {
-            if (ctx.reader.needed)
-              if (auto it = framework_dylibs.find(name); it != framework_dylibs.end())
-                it->second->is_alive = true;
-          } else {
-            i64 num_dylibs = ctx.dylibs.size();
-            read_file(ctx, mf);
-            if (ctx.dylibs.size() != num_dylibs)
-              framework_dylibs.emplace(name, ctx.dylibs.back());
-          }
-        }
-
-        j += 2;
-        continue;
-      }
-
-      if (opt == "-needed-l" || opt == "-l") {
-        if (j + 1 >= opts.size()) {
-          warn_malformed_linker_option(opt);
-          j++;
-          continue;
-        }
-
-        if (opt == "-needed-l")
-          ctx.reader.needed = true;
-
-        if (MappedFile<Context<E>> *mf = find_library(opts[j + 1])) {
-          std::string name = opts[j + 1];
-
-          if (!libs.insert(name).second) {
-            if (ctx.reader.needed)
-              if (auto it = lib_dylibs.find(name); it != lib_dylibs.end())
-                it->second->is_alive = true;
-          } else {
-            i64 num_dylibs = ctx.dylibs.size();
-            read_file(ctx, mf);
-            if (ctx.dylibs.size() != num_dylibs)
-              lib_dylibs.emplace(name, ctx.dylibs.back());
-          }
-        }
-
-        j += 2;
-        continue;
-      }
-
-      if (opt.starts_with("-needed-l")) {
-        if (opt.size() == std::string_view("-needed-l").size()) {
-          warn_malformed_linker_option(opt);
-          j++;
-          continue;
-        }
-
-        ctx.reader.needed = true;
-        std::string name = std::string(opt.substr(std::string_view("-needed-l").size()));
-
-        if (MappedFile<Context<E>> *mf = find_library(name)) {
-          if (!libs.insert(name).second) {
-            if (auto it = lib_dylibs.find(name); it != lib_dylibs.end())
-              it->second->is_alive = true;
-          } else {
-            i64 num_dylibs = ctx.dylibs.size();
-            read_file(ctx, mf);
-            if (ctx.dylibs.size() != num_dylibs)
-              lib_dylibs.emplace(name, ctx.dylibs.back());
-          }
-        }
-
-        j++;
-        continue;
-      }
-
-      if (opt.starts_with("-l")) {
-        if (opt.size() == std::string_view("-l").size()) {
-          warn_malformed_linker_option(opt);
-          j++;
-          continue;
-        }
-
-        std::string name = std::string(opt.substr(2));
-
-        if (MappedFile<Context<E>> *mf = find_library(name)) {
-          if (!libs.insert(name).second) {
-            if (ctx.reader.needed)
-              if (auto it = lib_dylibs.find(name); it != lib_dylibs.end())
-                it->second->is_alive = true;
-          } else {
-            i64 num_dylibs = ctx.dylibs.size();
-            read_file(ctx, mf);
-            if (ctx.dylibs.size() != num_dylibs)
-              lib_dylibs.emplace(name, ctx.dylibs.back());
-          }
-        }
-
-        j++;
-        continue;
-      }
-
-      warn_bad_linker_option(opt);
-      j++;
-    }
-
-    ctx.reader = orig;
+    process_linker_options(ctx, *ctx.objs[i]);
   }
 
   ctx.tg.wait();
-
-  std::unordered_set<std::string_view> hoisted_libs;
-  for (i64 i = 0; i < ctx.dylibs.size(); i++)
-    for (DylibFile<E> *file : ctx.dylibs[i]->hoisted_libs)
-      if (hoisted_libs.insert(file->install_name).second)
-        ctx.dylibs.push_back(file);
+  collect_hoisted_dylibs(ctx);
 
   if (ctx.objs.empty())
     Fatal(ctx) << "no input files";
 
-  for (ObjectFile<E> *file : ctx.objs)
-    file->priority = ctx.file_priority++;
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->priority = ctx.file_priority++;
-
   for (i64 i = 1; DylibFile<E> *file : ctx.dylibs)
     if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
       file->dylib_idx = i++;
+}
+
+template <typename E>
+void maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym) {
+  auto should_extract = [&](const Symbol<E> &sym) {
+    if (!sym.file)
+      return true;
+    if (sym.file->is_dylib)
+      return true;
+    if (sym.is_common)
+      return true;
+    return !sym.file->is_alive && sym.is_weak;
+  };
+
+  auto it = ctx.archive_symbol_map.find(sym.name);
+  if (it == ctx.archive_symbol_map.end())
+    return;
+
+  while (should_extract(sym)) {
+    bool loaded = false;
+
+    for (ArchiveMember<E> *member : it->second) {
+      if (member->is_loaded)
+        continue;
+
+      i64 obj_begin = ctx.objs.size();
+      i64 dylib_begin = ctx.dylibs.size();
+      ObjectFile<E> *file = load_archive_member(ctx, *member);
+      if (!file)
+        continue;
+
+      process_linker_options(ctx, *file);
+      resolve_new_files(ctx, obj_begin, dylib_begin);
+      loaded = true;
+      break;
+    }
+
+    if (!loaded)
+      break;
+  }
 }
 
 template <typename E>
@@ -1416,6 +1579,9 @@ static void print_stats(Context<E> &ctx) {
   static Counter num_dylibs("num_dylibs", ctx.dylibs.size());
 
   Counter::print();
+
+  for (const std::string &ent : ctx.archive_fallbacks)
+    std::cout << "archive_fallback=" << ent << "\n";
 }
 
 template <typename E>
@@ -1483,6 +1649,7 @@ int macho_main(int argc, char **argv) {
     file->convert_common_symbols(ctx);
 
   claim_unresolved_symbols(ctx);
+  finish_parsing_archive_members(ctx);
 
   if (ctx.arg.dead_strip)
     dead_strip(ctx);

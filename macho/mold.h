@@ -229,6 +229,7 @@ private:
   void split_cstring_literals(Context<E> &ctx);
   void split_fixed_size_literals(Context<E> &ctx);
   void split_literal_pointers(Context<E> &ctx);
+  void cache_subsection_spans();
   void build_subsection_lookup();
   InputSection<E> *get_common_sec(Context<E> &ctx);
   void parse_lto_symbols(Context<E> &ctx);
@@ -298,9 +299,15 @@ public:
                u32 secidx);
   void parse_relocations(Context<E> &ctx);
 
+  std::span<Subsection<E> *> get_subsections() const {
+    return std::span(file.subsections).subspan(subsec_offset, nsubsecs);
+  }
+
   ObjectFile<E> &file;
   const MachSection<E> &hdr;
   u32 secidx = 0;
+  u32 subsec_offset = 0;
+  u32 nsubsecs = 0;
   OutputSection<E> &osec;
   std::string_view contents;
   std::vector<Symbol<E> *> syms;

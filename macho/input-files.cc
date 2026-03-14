@@ -111,6 +111,8 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
     });
   }
 
+  cache_subsection_spans();
+
   {
     Timer t(ctx, "build_subsection_lookup_object", &timer);
     build_subsection_lookup();
@@ -363,6 +365,28 @@ void ObjectFile<E>::init_subsections(Context<E> &ctx) {
   }
 
   std::erase(subsections, nullptr);
+}
+
+template <typename E>
+void ObjectFile<E>::cache_subsection_spans() {
+  for (std::unique_ptr<InputSection<E>> &isec : sections)
+    if (isec) {
+      isec->subsec_offset = 0;
+      isec->nsubsecs = 0;
+    }
+
+  for (i64 i = 0; i < subsections.size();) {
+    InputSection<E> *isec = subsections[i]->isec;
+    ASSERT(isec && isec->nsubsecs == 0);
+
+    i64 j = i + 1;
+    while (j < subsections.size() && subsections[j]->isec == isec)
+      j++;
+
+    isec->subsec_offset = i;
+    isec->nsubsecs = j - i;
+    i = j;
+  }
 }
 
 // Split __cstring section.

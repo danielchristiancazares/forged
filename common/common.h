@@ -797,6 +797,8 @@ template <typename Context>
 class Timer {
 public:
   Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
+    if (!ctx.arg.perf) [[likely]]
+      return;
     record = new TimerRecord(name, parent ? parent->record : nullptr);
     ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
   }
@@ -804,15 +806,17 @@ public:
   Timer(const Timer &) = delete;
 
   ~Timer() {
-    record->stop();
+    if (record) [[unlikely]]
+      record->stop();
   }
 
   void stop() {
-    record->stop();
+    if (record) [[unlikely]]
+      record->stop();
   }
 
 private:
-  TimerRecord *record;
+  TimerRecord *record = nullptr;
 };
 
 //

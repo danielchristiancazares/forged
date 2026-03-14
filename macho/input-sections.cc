@@ -67,6 +67,14 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
 
 template <typename E>
 void InputSection<E>::parse_relocations(Context<E> &ctx) {
+  if (hdr.nreloc == 0) {
+    for (Subsection<E> *subsec : get_subsections()) {
+      subsec->rel_offset = 0;
+      subsec->nrels = 0;
+    }
+    return;
+  }
+
   Timer timer(ctx, "parse_relocations_section");
 
   {
@@ -76,38 +84,37 @@ void InputSection<E>::parse_relocations(Context<E> &ctx) {
     rels = std::span<Relocation<E>>(file.rels_pool).subspan(start);
   }
 
-  {
+  if (rels.size() > 1) {
     Timer t(ctx, "sort_relocations_section", &timer);
     sort_relocations_by_offset(rels);
   }
 
-  // Find subsections this relocation section refers to
-  auto begin = std::partition_point(file.subsections.begin(),
-                                    file.subsections.end(),
-                                    [&](Subsection<E> *subsec) {
-    return subsec->input_addr < hdr.addr;
-  });
+  std::span<Subsection<E> *> subsecs = get_subsections();
 
-  auto end = std::partition_point(begin, file.subsections.end(),
-                                    [&](Subsection<E> *subsec) {
-    return subsec->input_addr < hdr.addr + hdr.size;
-  });
+  if (subsecs.size() == 1) {
+    Subsection<E> *subsec = subsecs[0];
+    ASSERT(subsec->isec == this);
+    subsec->rel_offset = 0;
+    subsec->nrels = rels.size();
 
-  {
+    u32 input_offset = subsec->input_addr - hdr.addr;
+    if (input_offset)
+      for (Relocation<E> &r : rels)
+        r.offset -= input_offset;
+  } else {
     Timer t(ctx, "assign_relocations_section", &timer);
 
-    // Assign each subsection a group of relocations
     i64 i = 0;
-    for (auto it = begin; it < end; it++) {
-      Subsection<E> &subsec = **it;
-      subsec.rel_offset = i;
+    for (Subsection<E> *subsec : subsecs) {
+      ASSERT(subsec->isec == this);
+      subsec->rel_offset = i;
 
-      u32 input_offset = subsec.input_addr - subsec.isec->hdr.addr;
-      while (i < rels.size() && rels[i].offset < input_offset + subsec.input_size) {
+      u32 input_offset = subsec->input_addr - hdr.addr;
+      while (i < rels.size() && rels[i].offset < input_offset + subsec->input_size) {
         rels[i].offset -= input_offset;
         i++;
       }
-      subsec.nrels = i - subsec.rel_offset;
+      subsec->nrels = i - subsec->rel_offset;
     }
   }
 }

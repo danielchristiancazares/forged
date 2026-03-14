@@ -460,6 +460,22 @@ template <typename E>
 void OutputSection<E>::copy_buf(Context<E> &ctx) {
   assert(this->hdr.type != S_ZEROFILL);
 
+  if constexpr (is_x86<E>) {
+    if ((this->hdr.attr & S_ATTR_SOME_INSTRUCTIONS ||
+         this->hdr.attr & S_ATTR_PURE_INSTRUCTIONS) &&
+        this->members.size() > 1) {
+      tbb::parallel_for((i64)1, (i64)this->members.size(), [&](i64 i) {
+        Subsection<E> *prev = this->members[i - 1];
+        Subsection<E> *next = this->members[i];
+        i64 begin = prev->output_offset + prev->input_size;
+        i64 end = next->output_offset;
+
+        if (begin < end)
+          memset(ctx.buf + this->hdr.offset + begin, 0x90, end - begin);
+      });
+    }
+  }
+
   tbb::parallel_for_each(members, [&](Subsection<E> *subsec) {
     std::string_view data = subsec->get_contents();
     u8 *loc = ctx.buf + this->hdr.offset + subsec->output_offset;
@@ -1586,6 +1602,16 @@ bool operator<(const SymbolAddend<E> &a, const SymbolAddend<E> &b) {
   return a.addend < b.addend;
 }
 
+template <typename E>
+static i64 find_dynsym_ordinal(std::span<SymbolAddend<E>> dynsyms,
+                               Symbol<E> &sym, u64 addend) {
+  auto it = std::lower_bound(dynsyms.begin() + sym.fixup_ordinal, dynsyms.end(),
+                             SymbolAddend<E>{&sym, addend});
+  if (it != dynsyms.end() && it->sym == &sym && it->addend == addend)
+    return it - dynsyms.begin();
+  unreachable();
+}
+
 // A chained fixup can contain an addend if its value is equal to or
 // smaller than 255.
 static constexpr i64 MAX_INLINE_ADDEND = 255;
@@ -1822,17 +1848,10 @@ void ChainedFixupsSection<E>::write_fixup_chains(Context<E> &ctx) {
 
   auto page = [](u64 addr) { return addr & ~((u64)E::page_size - 1); };
 
-  auto get_ordinal = [&](i64 i, u64 addend) {
-    for (; i < dynsyms.size(); i++)
-      if (dynsyms[i].addend == addend)
-        return i;
-    unreachable();
-  };
-
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments) {
     std::span<Fixup<E>> fx = get_segment_fixups(fixups, *seg);
 
-    for (i64 i = 0; i < fx.size(); i++) {
+    tbb::parallel_for((i64)0, (i64)fx.size(), [&](i64 i) {
       constexpr u32 stride = 4;
 
       u32 next = 0;
@@ -1853,7 +1872,7 @@ void ChainedFixupsSection<E>::write_fixup_chains(Context<E> &ctx) {
           rec->ordinal = sym->fixup_ordinal;
           rec->addend = fx[i].addend;
         } else {
-          rec->ordinal = get_ordinal(sym->fixup_ordinal, fx[i].addend);
+          rec->ordinal = find_dynsym_ordinal(std::span(dynsyms), *sym, fx[i].addend);
           rec->addend = 0;
         }
 
@@ -1878,7 +1897,7 @@ void ChainedFixupsSection<E>::write_fixup_chains(Context<E> &ctx) {
         rec->next = next;
         rec->bind = 0;
       }
-    }
+    });
   }
 }
 

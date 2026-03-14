@@ -648,10 +648,29 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx) {
     });
   }
 
+  struct AddrSym {
+    u32 addr;
+    Symbol<E> *sym;
+  };
+
+  std::vector<AddrSym> extern_syms;
+  extern_syms.reserve(mach_syms.size());
+
+  for (i64 i = 0; i < mach_syms.size(); i++)
+    if (MachSym<E> &msym = mach_syms[i]; msym.is_extern && !msym.is_undef())
+      extern_syms.push_back({(u32)msym.value, this->syms[i]});
+
+  sort(extern_syms, [](const AddrSym &a, const AddrSym &b) {
+    return a.addr < b.addr;
+  });
+
   auto find_symbol = [&](u32 addr) -> Symbol<E> * {
-    for (i64 i = 0; i < mach_syms.size(); i++)
-      if (MachSym<E> &msym = mach_syms[i]; msym.is_extern && msym.value == addr)
-        return this->syms[i];
+    auto it = std::lower_bound(extern_syms.begin(), extern_syms.end(), addr,
+                               [](const AddrSym &ent, u32 value) {
+      return ent.addr < value;
+    });
+    if (it != extern_syms.end() && it->addr == addr)
+      return it->sym;
     return nullptr;
   };
 

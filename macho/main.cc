@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
+#include <tbb/parallel_for.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
 
@@ -36,6 +37,47 @@ static bool has_lto_obj(Context<E> &ctx) {
     if (file->lto_module && file->is_alive)
       return true;
   return false;
+}
+
+template <typename T, typename Pred>
+static i64 parallel_erase_if(std::vector<T> &vec, Pred pred) {
+  static constexpr i64 GRAIN_SIZE = 4096;
+
+  if (vec.size() < GRAIN_SIZE)
+    return std::erase_if(vec, pred);
+
+  i64 num_blocks = (vec.size() + GRAIN_SIZE - 1) / GRAIN_SIZE;
+  std::vector<i64> counts(num_blocks);
+
+  tbb::parallel_for((i64)0, num_blocks, [&](i64 block_idx) {
+    i64 begin = block_idx * GRAIN_SIZE;
+    i64 end = std::min<i64>(begin + GRAIN_SIZE, vec.size());
+    i64 count = 0;
+
+    for (i64 i = begin; i < end; i++)
+      if (!pred(vec[i]))
+        count++;
+    counts[block_idx] = count;
+  });
+
+  std::vector<i64> offsets(num_blocks + 1);
+  for (i64 i = 0; i < num_blocks; i++)
+    offsets[i + 1] = offsets[i] + counts[i];
+
+  std::vector<T> compacted(offsets.back());
+  tbb::parallel_for((i64)0, num_blocks, [&](i64 block_idx) {
+    i64 begin = block_idx * GRAIN_SIZE;
+    i64 end = std::min<i64>(begin + GRAIN_SIZE, vec.size());
+    i64 out = offsets[block_idx];
+
+    for (i64 i = begin; i < end; i++)
+      if (!pred(vec[i]))
+        compacted[out++] = std::move(vec[i]);
+  });
+
+  i64 removed = vec.size() - compacted.size();
+  vec = std::move(compacted);
+  return removed;
 }
 
 template <typename E>
@@ -642,7 +684,7 @@ static void uniquify_literals(Context<E> &ctx, OutputSection<E> &osec) {
   });
 
   static Counter counter("num_merged_strings");
-  counter += std::erase_if(osec.members, [](Subsection<E> *subsec) {
+  counter += parallel_erase_if(osec.members, [](Subsection<E> *subsec) {
     return subsec->is_replaced;
   });
 }
@@ -657,6 +699,21 @@ template <typename E>
 static void uniquify_literal_pointers(Context<E> &ctx, OutputSection<E> &osec) {
   Timer t(ctx, "uniquify_literal_pointers");
 
+  struct Entry {
+    Entry(i64 idx) : owner_idx(idx) {}
+    Entry(const Entry &other) = default;
+
+    Atomic<i64> owner_idx = -1;
+  };
+
+  struct SubsecRef {
+    i64 idx = -1;
+    Subsection<E> *subsec = nullptr;
+    Subsection<E> *target = nullptr;
+    u64 hash = 0;
+    Entry *ent = nullptr;
+  };
+
   auto get_target = [](Relocation<E> &r) -> Subsection<E> * {
     Subsection<E> *subsec = r.sym() ? r.sym()->subsec : r.subsec();
     if (!subsec)
@@ -664,25 +721,50 @@ static void uniquify_literal_pointers(Context<E> &ctx, OutputSection<E> &osec) {
     return subsec->is_replaced ? subsec->replacer : subsec;
   };
 
-  std::unordered_map<Subsection<E> *, Subsection<E> *> map;
-
-  for (Subsection<E> *subsec : osec.members) {
+  std::vector<SubsecRef> refs(osec.members.size());
+  tbb::parallel_for((i64)0, (i64)osec.members.size(), [&](i64 i) {
+    Subsection<E> *subsec = osec.members[i];
     assert(subsec->input_size == sizeof(Word<E>));
-    std::span<Relocation<E>> rels = subsec->get_rels();
 
-    if (rels.size() == 1) {
-      if (Subsection<E> *target = get_target(rels[0])) {
-        auto [it, inserted] = map.insert({target, subsec});
-        if (!inserted) {
-          subsec->replacer = it->second;
-          subsec->is_replaced = true;
-        }
-      }
+    refs[i].idx = i;
+    refs[i].subsec = subsec;
+
+    std::span<Relocation<E>> rels = subsec->get_rels();
+    if (rels.size() != 1)
+      return;
+
+    refs[i].target = get_target(rels[0]);
+    if (!refs[i].target)
+      return;
+
+    std::string_view key((char *)&refs[i].target, sizeof(refs[i].target));
+    refs[i].hash = hash_string(key);
+  });
+
+  ConcurrentMap<Entry> map(osec.members.size() * 3 / 2);
+
+  tbb::parallel_for_each(refs, [&](SubsecRef &ref) {
+    if (!ref.target)
+      return;
+
+    std::string_view key((char *)&ref.target, sizeof(ref.target));
+    ref.ent = map.insert(key, ref.hash, {ref.idx}).first;
+    update_minimum(ref.ent->owner_idx, ref.idx);
+  });
+
+  tbb::parallel_for_each(refs, [&](SubsecRef &ref) {
+    if (!ref.ent)
+      return;
+
+    Subsection<E> *owner = refs[ref.ent->owner_idx].subsec;
+    if (ref.subsec != owner) {
+      ref.subsec->replacer = owner;
+      ref.subsec->is_replaced = true;
     }
-  }
+  });
 
   static Counter counter("num_merged_literal_pointers");
-  counter += std::erase_if(osec.members, [](Subsection<E> *subsec) {
+  counter += parallel_erase_if(osec.members, [](Subsection<E> *subsec) {
     return subsec->is_replaced;
   });
 }
@@ -889,6 +971,31 @@ static void fix_synthetic_symbol_values(Context<E> &ctx) {
 }
 
 template <typename E>
+static void fill_text_segment_gaps(Context<E> &ctx, OutputSegment<E> &seg) {
+  if constexpr (!is_x86<E>)
+    return;
+
+  if (seg.cmd.get_segname() != "__TEXT")
+    return;
+
+  i64 seg_begin = seg.cmd.fileoff;
+  i64 seg_end = seg.cmd.fileoff + seg.cmd.filesize;
+
+  tbb::parallel_for((i64)0, (i64)seg.chunks.size() + 1, [&](i64 i) {
+    i64 begin = seg_begin;
+    if (i > 0)
+      begin = seg.chunks[i - 1]->hdr.offset + seg.chunks[i - 1]->hdr.size;
+
+    i64 end = seg_end;
+    if (i < seg.chunks.size())
+      end = seg.chunks[i]->hdr.offset;
+
+    if (begin < end)
+      memset(ctx.buf + begin, 0x90, end - begin);
+  });
+}
+
+template <typename E>
 static void copy_sections_to_output_file(Context<E> &ctx) {
   Timer t(ctx, "copy_sections_to_output_file");
 
@@ -896,13 +1003,9 @@ static void copy_sections_to_output_file(Context<E> &ctx) {
                          [&](std::unique_ptr<OutputSegment<E>> &seg) {
     Timer t2(ctx, std::string(seg->cmd.get_segname()), &t);
 
-    // Fill text segment paddings with single-byte NOP instructions so
-    // that otool wouldn't out-of-sync when disassembling an output file.
-    // Do this only for x86-64 because ARM64 instructions are always 4
-    // bytes long.
-    if constexpr (is_x86<E>)
-      if (seg->cmd.get_segname() == "__TEXT")
-        memset(ctx.buf + seg->cmd.fileoff, 0x90, seg->cmd.filesize);
+    // Keep x86 text padding disassembler-friendly without rewriting the
+    // entire segment up front.
+    fill_text_segment_gaps(ctx, *seg);
 
     tbb::parallel_for_each(seg->chunks, [&](Chunk<E> *sec) {
       if (sec->hdr.type != S_ZEROFILL) {

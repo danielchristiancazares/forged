@@ -513,6 +513,7 @@ static void claim_unresolved_symbols(Context<E> &ctx) {
 
   if (!msgsend_syms2.empty()) {
     ctx.objc_stubs.reset(new ObjcStubsSection<E>(ctx));
+    ctx.internal_obj->rels_pool.reserve(msgsend_syms2.size());
     for (Symbol<E> *sym : msgsend_syms2)
       ctx.internal_obj->add_msgsend_symbol(ctx, *sym);
   }

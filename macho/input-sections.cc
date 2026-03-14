@@ -3,7 +3,7 @@
 namespace mold::macho {
 
 template <typename T>
-static void sort_relocations_by_offset(std::vector<T> &vec) {
+static void sort_relocations_by_offset(std::span<T> vec) {
   if (vec.size() < 2)
     return;
 
@@ -71,7 +71,9 @@ void InputSection<E>::parse_relocations(Context<E> &ctx) {
 
   {
     Timer t(ctx, "read_relocations_section", &timer);
-    rels = read_relocations(ctx, file, hdr);
+    i64 start = file.rels_pool.size();
+    read_relocations(ctx, file, hdr, file.rels_pool);
+    rels = std::span<Relocation<E>>(file.rels_pool).subspan(start);
   }
 
   {

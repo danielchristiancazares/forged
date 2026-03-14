@@ -199,6 +199,7 @@ public:
   Relocation<E> read_reloc(Context<E> &ctx, const MachSection<E> &hdr, MachRel r);
 
   std::vector<std::unique_ptr<InputSection<E>>> sections;
+  std::vector<Relocation<E>> rels_pool;
   std::vector<Subsection<E> *> subsections;
   std::vector<Subsection<E> *> sym_to_subsec;
   std::span<MachSym<E>> mach_syms;
@@ -303,7 +304,7 @@ public:
   OutputSection<E> &osec;
   std::string_view contents;
   std::vector<Symbol<E> *> syms;
-  std::vector<Relocation<E>> rels;
+  std::span<Relocation<E>> rels;
 };
 
 template <typename E>
@@ -328,7 +329,7 @@ public:
   }
 
   std::span<Relocation<E>> get_rels() const {
-    return std::span<Relocation<E>>(isec->rels).subspan(rel_offset, nrels);
+    return isec->rels.subspan(rel_offset, nrels);
   }
 
   void scan_relocations(Context<E> &ctx);
@@ -355,8 +356,9 @@ public:
 };
 
 template <typename E>
-std::vector<Relocation<E>>
-read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr);
+void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
+                      const MachSection<E> &hdr,
+                      std::vector<Relocation<E>> &vec);
 
 //
 // Symbol

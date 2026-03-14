@@ -160,10 +160,10 @@ void ObjcStubsSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <>
-std::vector<Relocation<E>>
-read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr) {
-  std::vector<Relocation<E>> vec;
-  vec.reserve(hdr.nreloc);
+void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
+                      const MachSection<E> &hdr,
+                      std::vector<Relocation<E>> &vec) {
+  vec.reserve(vec.size() + hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
 
@@ -221,8 +221,6 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr
       rel.addend = addr - target->input_addr;
     }
   }
-
-  return vec;
 }
 
 template <>

@@ -137,6 +137,12 @@ void ObjectFile<E>::finish_parse(Context<E> &ctx) {
 
   Timer timer(ctx, "finish_parse_object");
 
+  i64 total_rels = 0;
+  for (std::unique_ptr<InputSection<E>> &isec : sections)
+    if (isec)
+      total_rels += isec->hdr.nreloc;
+  rels_pool.reserve(total_rels);
+
   {
     Timer t(ctx, "parse_relocations_object", &timer);
     for (std::unique_ptr<InputSection<E>> &isec : sections)
@@ -1309,13 +1315,15 @@ ObjectFile<E>::add_selrefs(Context<E> &ctx, Subsection<E> &methname) {
   isec->contents = "\0\0\0\0\0\0\0\0"sv;
 
   // Create a dummy relocation
-  isec->rels.push_back(Relocation<E>{
+  i64 rel_idx = rels_pool.size();
+  rels_pool.push_back(Relocation<E>{
     .target = &methname,
     .offset = 0,
     .type = E::abs_rel,
     .size = (u8)sizeof(Word<E>),
     .is_sym = false,
   });
+  isec->rels = std::span<Relocation<E>>(rels_pool).subspan(rel_idx, 1);
 
   // Create a dummy subsection
   Subsection<E> *subsec = new Subsection<E>{

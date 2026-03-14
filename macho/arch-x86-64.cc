@@ -112,9 +112,13 @@ static i64 read_addend(u8 *buf, const MachRel &r) {
 }
 
 template <>
-std::vector<Relocation<E>>
-read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr) {
-  std::vector<Relocation<E>> vec(hdr.nreloc);
+void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
+                      const MachSection<E> &hdr,
+                      std::vector<Relocation<E>> &vec) {
+  i64 start = vec.size();
+  vec.resize(start + hdr.nreloc);
+  std::span<Relocation<E>> rels_out(vec);
+  rels_out = rels_out.subspan(start, hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
   u8 *contents = file.mf->data + hdr.offset;
@@ -175,17 +179,15 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection<E> &hdr
         j--;
 
       for (i64 k = j; k < i; k++)
-        fill(vec[out++], rels[k], k);
+        fill(rels_out[out++], rels[k], k);
       i = j;
     }
 
     ASSERT(out == hdr.nreloc);
   } else {
     for (i64 i = 0; i < hdr.nreloc; i++)
-      fill(vec[i], rels[i], i);
+      fill(rels_out[i], rels[i], i);
   }
-
-  return vec;
 }
 
 template <>

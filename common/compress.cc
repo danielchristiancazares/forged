@@ -110,9 +110,12 @@ ZlibCompressor::ZlibCompressor(u8 *buf, i64 size) {
   });
 
   // Combine checksums
-  checksum = adlers[0];
-  for (i64 i = 1; i < inputs.size(); i++)
-    checksum = adler32_combine(checksum, adlers[i], inputs[i].size());
+  checksum = adler32(1, Z_NULL, 0);
+  if (!inputs.empty()) {
+    checksum = adlers[0];
+    for (i64 i = 1; i < inputs.size(); i++)
+      checksum = adler32_combine(checksum, adlers[i], inputs[i].size());
+  }
 
   // Comput the total size
   compressed_size = 8; // the header and the trailer
@@ -127,13 +130,15 @@ void ZlibCompressor::write_to(u8 *buf) {
 
   // Copy compressed data
   std::vector<i64> offsets(shards.size());
-  offsets[0] = 2; // +2 for header
-  for (i64 i = 1; i < shards.size(); i++)
-    offsets[i] = offsets[i - 1] + shards[i - 1].size();
+  if (!shards.empty()) {
+    offsets[0] = 2; // +2 for header
+    for (i64 i = 1; i < shards.size(); i++)
+      offsets[i] = offsets[i - 1] + shards[i - 1].size();
 
-  tbb::parallel_for((i64)0, (i64)shards.size(), [&](i64 i) {
-    memcpy(&buf[offsets[i]], shards[i].data(), shards[i].size());
-  });
+    tbb::parallel_for((i64)0, (i64)shards.size(), [&](i64 i) {
+      memcpy(&buf[offsets[i]], shards[i].data(), shards[i].size());
+    });
+  }
 
   // Write a trailer
   u8 *end = buf + compressed_size;

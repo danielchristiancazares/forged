@@ -15,6 +15,8 @@ read_response_file(Context &ctx, std::string_view path) {
     std::string buf;
     while (i < mf->size && data[i] != quote) {
       if (data[i] == '\\') {
+        if (i + 1 >= mf->size)
+          Fatal(ctx) << path << ": premature end of input";
         buf.append(1, data[i + 1]);
         i += 2;
       } else {

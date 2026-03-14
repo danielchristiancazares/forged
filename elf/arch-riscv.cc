@@ -160,6 +160,10 @@ static void set_rs1(u8 *loc, u32 rs1) {
   *(ul32 *)loc |= rs1 << 15;
 }
 
+static bool is_int12(i64 val) {
+  return sign_extend(val, 11) == val;
+}
+
 template <typename E>
 void write_plt_header(Context<E> &ctx, u8 *buf) {
   static const ul32 insn_64[] = {
@@ -394,9 +398,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         write_stype(loc, S + A);
 
       // Rewrite `lw t1, 0(t0)` with `lw t1, 0(x0)` if the address is
-      // accessible relative to the zero register. If the upper 20 bits
-      // are all zero, the corresponding LUI might have been removed.
-      if (bits(S + A, 31, 12) == 0)
+      // directly accessible using the zero register. In that case, the
+      // corresponding LUI might have been removed.
+      if (is_int12((i64)(S + A)))
         set_rs1(loc, 0);
       break;
     case R_RISCV_TPREL_HI20:
@@ -823,10 +827,10 @@ static void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc)
       break;
     }
     case R_RISCV_HI20:
-      // If the upper 20 bits are all zero, we can remove LUI.
-      // The corresponding instructions referred to by LO12_I/LO12_S
-      // relocations will use the zero register instead.
-      if (bits(sym.get_addr(ctx), 31, 12) == 0)
+      // If the relocated value fits in a signed 12-bit immediate, we
+      // can remove LUI. The corresponding LO12 relocation will then
+      // address it using x0 directly.
+      if (i64 val = sym.get_addr(ctx) + r.r_addend; is_int12(val))
         delta += 4;
       break;
     case R_RISCV_TPREL_HI20:

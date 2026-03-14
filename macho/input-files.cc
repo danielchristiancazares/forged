@@ -126,8 +126,11 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
   // Archive members need symbol and subsection data for extraction decisions,
   // but most never survive symbol resolution. Defer relocation and unwind
   // parsing until we know the member is actually part of the link.
-  if (!this->archive_name.empty() && !this->is_alive)
+  if (!this->archive_name.empty() && !this->is_alive) {
+    if (total_nreloc == 0 && !unwind_sec && !eh_frame_sec && !mod_init_func)
+      fully_parsed = true;
     return;
+  }
 
   finish_parse(ctx);
 }
@@ -139,16 +142,12 @@ void ObjectFile<E>::finish_parse(Context<E> &ctx) {
 
   Timer timer(ctx, "finish_parse_object");
 
-  i64 total_rels = 0;
-  for (std::unique_ptr<InputSection<E>> &isec : sections)
-    if (isec)
-      total_rels += isec->hdr.nreloc;
-  rels_pool.reserve(total_rels);
+  rels_pool.reserve(total_nreloc);
 
-  {
+  if (total_nreloc != 0) {
     Timer t(ctx, "parse_relocations_object", &timer);
     for (std::unique_ptr<InputSection<E>> &isec : sections)
-      if (isec)
+      if (isec && isec->hdr.nreloc)
         isec->parse_relocations(ctx);
   }
 
@@ -233,6 +232,7 @@ void ObjectFile<E>::parse_sections(Context<E> &ctx) {
       continue;
 
     sections[i].reset(new InputSection<E>(ctx, *this, msec, i));
+    total_nreloc += msec.nreloc;
   }
 }
 

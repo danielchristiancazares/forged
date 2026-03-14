@@ -241,6 +241,7 @@ private:
   MachSection<E> *unwind_sec = nullptr;
   std::unique_ptr<MachSection<E>> common_hdr;
   InputSection<E> *common_sec = nullptr;
+  i64 total_nreloc = 0;
   bool has_debug_info = false;
   bool fully_parsed = false;
 

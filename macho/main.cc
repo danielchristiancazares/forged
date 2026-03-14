@@ -39,6 +39,31 @@ static bool has_lto_obj(Context<E> &ctx) {
   return false;
 }
 
+template <typename E>
+static u64 get_symbol_rank(InputFile<E> *file, bool is_common, bool is_weak) {
+  bool is_in_archive = !file->is_alive;
+
+  auto get_sym_rank = [&] {
+    if (is_common) {
+      assert(!file->is_dylib);
+      return is_in_archive ? 6 : 5;
+    }
+
+    if (file->is_dylib || is_in_archive)
+      return is_weak ? 4 : 3;
+    return is_weak ? 2 : 1;
+  };
+
+  return (get_sym_rank() << 24) + file->priority;
+}
+
+template <typename E>
+static u64 get_symbol_rank(Symbol<E> &sym) {
+  if (!sym.file)
+    return 7 << 24;
+  return get_symbol_rank(sym.file, sym.is_common, sym.is_weak);
+}
+
 template <typename T, typename Pred>
 static i64 parallel_erase_if(std::vector<T> &vec, Pred pred) {
   static constexpr i64 GRAIN_SIZE = 4096;
@@ -81,14 +106,123 @@ static i64 parallel_erase_if(std::vector<T> &vec, Pred pred) {
 }
 
 template <typename E>
+struct ObjectSymbolCandidate {
+  Symbol<E> *sym = nullptr;
+  ObjectFile<E> *file = nullptr;
+  Subsection<E> *subsec = nullptr;
+  u64 value = 0;
+  u64 rank = 0;
+  bool is_common = false;
+  bool is_weak = false;
+  bool is_abs = false;
+  bool is_tlv = false;
+  bool no_dead_strip = false;
+};
+
+template <typename E>
+static void apply_object_symbol_candidate(Symbol<E> &sym,
+                                          const ObjectSymbolCandidate<E> &cand) {
+  sym.file = cand.file;
+  sym.visibility = SCOPE_MODULE;
+  sym.is_common = cand.is_common;
+  sym.is_weak = cand.is_weak;
+  sym.is_abs = cand.is_abs;
+  sym.is_tlv = cand.is_tlv;
+  sym.no_dead_strip = cand.no_dead_strip;
+  sym.is_imported = false;
+  sym.is_exported = false;
+  sym.subsec = cand.subsec;
+  sym.value = cand.value;
+}
+
+template <typename E>
+static void collect_object_symbol_candidates(
+    Context<E> &ctx, ObjectFile<E> &file,
+    std::vector<ObjectSymbolCandidate<E>> &out) {
+  out.reserve(file.syms.size());
+
+  for (i64 i = 0; i < file.syms.size(); i++) {
+    MachSym<E> &msym = file.mach_syms[i];
+    if (!msym.is_extern || msym.is_undef())
+      continue;
+
+    InputFile<E> *ifile = &file;
+    Symbol<E> &sym = *file.syms[i];
+    ObjectSymbolCandidate<E> cand{
+      .sym = &sym,
+      .file = &file,
+      .rank = get_symbol_rank(ifile, msym.is_common(),
+                              (msym.desc & N_WEAK_DEF)),
+      .is_common = msym.is_common(),
+      .is_weak = (bool)(msym.desc & N_WEAK_DEF),
+      .no_dead_strip = (bool)(msym.desc & N_NO_DEAD_STRIP),
+    };
+
+    switch (msym.type) {
+    case N_UNDF:
+      ASSERT(msym.is_common());
+      cand.value = msym.value;
+      break;
+    case N_ABS:
+      cand.is_abs = true;
+      cand.value = msym.value;
+      break;
+    case N_SECT:
+      cand.subsec = file.sym_to_subsec[i];
+      if (!cand.subsec)
+        cand.subsec = file.find_subsection(ctx, msym.value);
+      if (!cand.subsec)
+        continue;
+      cand.value = msym.value - cand.subsec->input_addr;
+      cand.is_common = false;
+      cand.is_tlv =
+        (cand.subsec->isec->hdr.type == S_THREAD_LOCAL_VARIABLES);
+      break;
+    default:
+      Fatal(ctx) << sym << ": unknown symbol type: " << (u64)msym.type;
+    }
+
+    out.push_back(cand);
+  }
+}
+
+template <typename E>
+static void resolve_object_symbols(Context<E> &ctx,
+                                   std::span<ObjectFile<E> *> files) {
+  if (files.empty())
+    return;
+
+  std::vector<std::vector<ObjectSymbolCandidate<E>>> per_file(files.size());
+  tbb::parallel_for((i64)0, (i64)files.size(), [&](i64 i) {
+    collect_object_symbol_candidates(ctx, *files[i], per_file[i]);
+  });
+
+  std::vector<ObjectSymbolCandidate<E>> candidates = flatten(per_file);
+  if (candidates.empty())
+    return;
+
+  tbb::parallel_sort(candidates, [](const ObjectSymbolCandidate<E> &a,
+                                    const ObjectSymbolCandidate<E> &b) {
+    return std::tuple{a.sym, a.rank} < std::tuple{b.sym, b.rank};
+  });
+
+  for (i64 i = 0; i < candidates.size();) {
+    i64 j = i + 1;
+    while (j < candidates.size() && candidates[j].sym == candidates[i].sym)
+      j++;
+
+    if (candidates[i].rank <= get_symbol_rank(*candidates[i].sym))
+      apply_object_symbol_candidate(*candidates[i].sym, candidates[i]);
+    i = j;
+  }
+}
+
+template <typename E>
 static void resolve_symbols(Context<E> &ctx) {
   Timer t(ctx, "resolve_symbols");
 
-  std::vector<InputFile<E> *> files;
-  append(files, ctx.objs);
-  append(files, ctx.dylibs);
-
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+  resolve_object_symbols(ctx, ctx.objs);
+  tbb::parallel_for_each(ctx.dylibs, [&](DylibFile<E> *file) {
     file->resolve_symbols(ctx);
   });
 
@@ -134,6 +268,7 @@ static void resolve_symbols(Context<E> &ctx) {
     mark_live_objects();
   }
 
+  std::vector<InputFile<E> *> files;
   files.clear();
   append(files, ctx.objs);
   append(files, ctx.dylibs);
@@ -144,9 +279,16 @@ static void resolve_symbols(Context<E> &ctx) {
       file->clear_symbols();
   });
 
+  std::vector<ObjectFile<E> *> live_objs;
+  live_objs.reserve(ctx.objs.size());
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->is_alive)
+      live_objs.push_back(file);
+
   // Redo symbol resolution because extracting object files from archives
   // may raise the priority of symbols defined by the object file.
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+  resolve_object_symbols(ctx, live_objs);
+  tbb::parallel_for_each(ctx.dylibs, [&](DylibFile<E> *file) {
     if (file->is_alive)
       file->resolve_symbols(ctx);
   });
@@ -530,10 +672,51 @@ static void finish_parsing_archive_members(Context<E> &ctx) {
   Timer t(ctx, "finish_parsing_archive_members");
   static Counter counter("num_archive_members_finish_parsed");
 
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    if (file->needs_finish_parse()) {
+  auto get_backing_mf = [](ObjectFile<E> *file) {
+    if (file->mf->parent)
+      return file->mf->parent;
+    if (file->mf->thin_parent)
+      return file->mf;
+    return file->mf;
+  };
+
+  auto get_locality_key = [](ObjectFile<E> *file) {
+    if (file->mf->parent)
+      return file->mf->get_offset();
+    return (i64)0;
+  };
+
+  std::vector<ObjectFile<E> *> pending;
+  pending.reserve(ctx.objs.size());
+
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->needs_finish_parse())
+      pending.push_back(file);
+
+  if (pending.empty())
+    return;
+
+  sort(pending, [&](ObjectFile<E> *a, ObjectFile<E> *b) {
+    MappedFile<Context<E>> *mf_a = get_backing_mf(a);
+    MappedFile<Context<E>> *mf_b = get_backing_mf(b);
+
+    if (mf_a != mf_b)
+      return (uintptr_t)mf_a < (uintptr_t)mf_b;
+
+    i64 key_a = get_locality_key(a);
+    i64 key_b = get_locality_key(b);
+    if (key_a != key_b)
+      return key_a < key_b;
+    return a->priority < b->priority;
+  });
+
+  static constexpr i64 GRAIN_SIZE = 8;
+
+  tbb::parallel_for(tbb::blocked_range<i64>(0, (i64)pending.size(), GRAIN_SIZE),
+                    [&](const tbb::blocked_range<i64> &range) {
+    for (i64 i = range.begin(); i < range.end(); i++) {
       counter++;
-      file->finish_parse(ctx);
+      pending[i]->finish_parse(ctx);
     }
   });
 }
@@ -1076,8 +1259,7 @@ static void resolve_new_files(Context<E> &ctx, i64 obj_begin, i64 dylib_begin) {
   for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
     ctx.dylibs[i]->resolve_symbols(ctx);
 
-  for (i64 i = obj_begin; i < ctx.objs.size(); i++)
-    ctx.objs[i]->resolve_symbols(ctx);
+  resolve_object_symbols(ctx, std::span(ctx.objs).subspan(obj_begin));
 }
 
 template <typename E>
@@ -1441,6 +1623,7 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 static std::vector<std::string>
 read_filelist(Context<E> &ctx, std::string arg) {
+  Timer t(ctx, "expand_filelist");
   std::string path;
   std::string dir;
 
@@ -1467,12 +1650,15 @@ read_filelist(Context<E> &ctx, std::string arg) {
 template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
+  static Counter direct_inputs("num_direct_input_args");
+  static Counter filelist_inputs("num_filelist_entries");
 
   while (!args.empty()) {
     const std::string &opt = args[0];
     args = args.subspan(1);
 
     if (!opt.starts_with('-')) {
+      direct_inputs++;
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, opt));
       continue;
     }
@@ -1495,7 +1681,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     ReaderContext orig = ctx.reader;
 
     if (opt == "-filelist") {
-      for (std::string &path : read_filelist(ctx, arg)) {
+      std::vector<std::string> paths = read_filelist(ctx, arg);
+      filelist_inputs += paths.size();
+      for (std::string &path : paths) {
         MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
         if (!mf)
           Fatal(ctx) << "-filelist " << arg << ": cannot open file: " << path;
@@ -1543,12 +1731,17 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any. We accept the common
   // autolink forms and warn for the rest instead of hard-failing.
-  for (i64 i = 0; i < ctx.objs.size(); i++) {
-    process_linker_options(ctx, *ctx.objs[i]);
+  {
+    Timer t2(ctx, "process_linker_options");
+    for (i64 i = 0; i < ctx.objs.size(); i++)
+      process_linker_options(ctx, *ctx.objs[i]);
   }
 
-  ctx.tg.wait();
-  collect_hoisted_dylibs(ctx);
+  {
+    Timer t2(ctx, "wait_input_parsers");
+    ctx.tg.wait();
+    collect_hoisted_dylibs(ctx);
+  }
 
   if (ctx.objs.empty())
     Fatal(ctx) << "no input files";

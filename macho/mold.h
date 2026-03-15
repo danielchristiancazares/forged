@@ -206,7 +206,8 @@ public:
   bool needs_finish_parse() const;
   bool can_start_finish_parse_early() const;
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
-  std::vector<std::string> get_linker_options(Context<E> &ctx);
+  std::span<const std::string> get_linker_options() const;
+  void materialize_local_symbols(Context<E> &ctx);
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
   void parse_compact_unwind(Context<E> &ctx);
   void parse_eh_frame(Context<E> &ctx);
@@ -243,11 +244,13 @@ public:
 
   // For the internal file and LTO object files
   std::vector<MachSym<E>> mach_syms2;
+  i64 autolink_ordinal = 0;
 
   // For the internal file
   void add_msgsend_symbol(Context<E> &ctx, Symbol<E> &sym);
 
 private:
+  void parse_linker_options();
   void parse_sections(Context<E> &ctx);
   void parse_symbols(Context<E> &ctx);
   void split_subsections_via_symbols(Context<E> &ctx);
@@ -271,7 +274,10 @@ private:
   bool has_debug_info = false;
   bool may_have_common_symbols = false;
   Atomic<bool> fully_parsed = false;
+  Atomic<bool> local_symbols_materialized = true;
   std::once_flag finish_parse_once;
+  std::once_flag local_symbols_once;
+  std::vector<std::string> linker_options;
 
   static constexpr u32 SUBSECTION_LOOKUP_SHIFT = 8;
   static constexpr u32 NO_SUBSECTION = -1;
@@ -1072,7 +1078,10 @@ template <typename E>
 void do_lto(Context<E> &ctx);
 
 template <typename E>
-void maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym);
+bool maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym);
+
+template <typename E>
+bool drain_archive_member_frontier(Context<E> &ctx);
 
 //
 // arch-arm64.cc
@@ -1286,6 +1295,26 @@ struct Context {
     archive_finish_early_arena.execute([&] { archive_finish_early_tg.wait(); });
   }
 
+  void enqueue_parsed_object(ObjectFile<E> *file) {
+    std::scoped_lock lock(autolink_mu);
+    ready_autolink_objects.emplace(file->autolink_ordinal, file);
+  }
+
+  std::vector<ObjectFile<E> *> take_parsed_object_autolink_frontier() {
+    std::vector<ObjectFile<E> *> files;
+
+    std::scoped_lock lock(autolink_mu);
+    for (;;) {
+      auto it = ready_autolink_objects.find(next_autolink_to_process);
+      if (it == ready_autolink_objects.end())
+        break;
+      files.push_back(it->second);
+      ready_autolink_objects.erase(it);
+      next_autolink_to_process++;
+    }
+    return files;
+  }
+
   ReaderContext reader;
   std::vector<std::string_view> cmdline_args;
   tbb::task_group tg;
@@ -1294,8 +1323,15 @@ struct Context {
   tbb::task_group archive_finish_early_tg;
   u32 output_type = MH_EXECUTE;
   i64 next_object_priority = 10000;
+  i64 next_autolink_ordinal = 0;
+  i64 next_autolink_to_process = 0;
   i64 next_dylib_priority = 8'000'000;
+  i64 pending_archive_obj_begin = -1;
+  i64 pending_archive_dylib_begin = -1;
   std::set<std::string> missing_files; // for -dependency_info
+  std::mutex autolink_mu;
+  std::map<i64, ObjectFile<E> *> ready_autolink_objects;
+  std::unordered_set<Symbol<E> *> pending_archive_symbols;
 
   u8 uuid[16] = {};
   bool has_error = false;

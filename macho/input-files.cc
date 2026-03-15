@@ -23,6 +23,8 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file) {
 template <typename E>
 void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : syms) {
+    if (!sym)
+      continue;
     if (__atomic_load_n(&sym->file, __ATOMIC_ACQUIRE) == this) {
       sym->visibility = SCOPE_LOCAL;
       sym->is_imported = false;
@@ -46,6 +48,7 @@ ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
   ObjectFile<E> *obj = new ObjectFile<E>(mf);
   obj->prepare_for_parse();
   obj->archive_name = archive_name;
+  obj->autolink_ordinal = ctx.next_autolink_ordinal++;
   obj->is_alive = archive_name.empty() || ctx.reader.all_load;
   obj->is_hidden = ctx.reader.hidden;
   ctx.obj_pool.emplace_back(obj);
@@ -55,9 +58,13 @@ ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
 template <typename E>
 void ObjectFile<E>::parse(Context<E> &ctx) {
   struct ParseNotifier {
+    Context<E> &ctx;
     ObjectFile<E> &file;
-    ~ParseNotifier() { file.notify_parse_complete(); }
-  } notifier{*this};
+    ~ParseNotifier() {
+      ctx.enqueue_parsed_object(&file);
+      file.notify_parse_complete();
+    }
+  } notifier{ctx, *this};
 
   Timer timer(ctx, "parse_object");
 
@@ -88,6 +95,8 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
 
   if (SymtabCommand *cmd = (SymtabCommand *)find_load_command(ctx, LC_SYMTAB))
     mach_syms = {(MachSym<E> *)(this->mf->data + cmd->symoff), cmd->nsyms};
+
+  parse_linker_options();
 
   {
     Timer t(ctx, "parse_sections_object", &timer);
@@ -150,6 +159,11 @@ void ObjectFile<E>::finish_parse(Context<E> &ctx) {
     return;
 
   Timer timer(ctx, "finish_parse_object");
+
+  if (!local_symbols_materialized) {
+    Timer t(ctx, "materialize_local_symbols_object", &timer);
+    materialize_local_symbols(ctx);
+  }
 
   rels_pool.reserve(total_nreloc);
 
@@ -542,24 +556,40 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
   SymtabCommand *cmd = (SymtabCommand *)find_load_command(ctx, LC_SYMTAB);
   this->syms.resize(mach_syms.size());
   may_have_common_symbols = false;
-
+  bool defer_local_symbols = !this->archive_name.empty() && !this->is_alive;
   i64 nlocal = 0;
   for (MachSym<E> &msym : mach_syms)
     if (!msym.is_extern)
       nlocal++;
-  local_syms.resize(nlocal);
+
+  if (!defer_local_symbols) {
+    local_syms.resize(nlocal);
+  } else {
+    static Counter deferred_objs("num_archive_members_local_symbols_deferred");
+    static Counter deferred_syms("num_archive_member_local_symbols_deferred");
+    deferred_objs++;
+    deferred_syms += (int)nlocal;
+    local_syms.clear();
+  }
   i64 local_idx = 0;
 
   for (i64 i = 0; i < mach_syms.size(); i++) {
     MachSym<E> &msym = mach_syms[i];
-    std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
 
     // Global symbol
     if (msym.is_extern) {
+      std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
       may_have_common_symbols |= msym.is_common();
       this->syms[i] = get_symbol(ctx, name);
       continue;
     }
+
+    if (defer_local_symbols) {
+      this->syms[i] = nullptr;
+      continue;
+    }
+
+    std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
 
     // Local symbol
     Symbol<E> &sym = local_syms[local_idx++];
@@ -587,19 +617,79 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
       }
     }
   }
+
+  local_symbols_materialized = !defer_local_symbols;
+}
+
+template <typename E>
+void ObjectFile<E>::materialize_local_symbols(Context<E> &ctx) {
+  if (local_symbols_materialized)
+    return;
+
+  std::call_once(local_symbols_once, [&] {
+    if (local_symbols_materialized)
+      return;
+
+    SymtabCommand *cmd = (SymtabCommand *)find_load_command(ctx, LC_SYMTAB);
+    if (!cmd) {
+      local_symbols_materialized = true;
+      return;
+    }
+
+    i64 nlocal = 0;
+    for (MachSym<E> &msym : mach_syms)
+      if (!msym.is_extern)
+        nlocal++;
+    local_syms.resize(nlocal);
+    static Counter late_objs("num_archive_members_local_symbols_materialized_late");
+    static Counter late_syms("num_archive_member_local_symbols_materialized_late");
+    late_objs++;
+    late_syms += (int)nlocal;
+
+    i64 local_idx = 0;
+    for (i64 i = 0; i < mach_syms.size(); i++) {
+      MachSym<E> &msym = mach_syms[i];
+      if (msym.is_extern)
+        continue;
+
+      std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
+      Symbol<E> &sym = local_syms[local_idx++];
+      sym.name = name;
+      this->syms[i] = &sym;
+
+      sym.file = this;
+      sym.visibility = SCOPE_LOCAL;
+      sym.no_dead_strip = (msym.desc & N_NO_DEAD_STRIP);
+
+      if (msym.type == N_ABS) {
+        sym.value = msym.value;
+        sym.is_abs = true;
+      } else if (!msym.stab && msym.type == N_SECT) {
+        sym.subsec = sym_to_subsec[i];
+        if (!sym.subsec)
+          sym.subsec = find_subsection(ctx, msym.value);
+
+        if (sym.subsec) {
+          sym.value = msym.value - sym.subsec->input_addr;
+          sym.is_tlv = (sym.subsec->isec->hdr.type == S_THREAD_LOCAL_VARIABLES);
+        } else {
+          sym.value = msym.value;
+        }
+      }
+    }
+
+    local_symbols_materialized = true;
+  });
 }
 
 // A Mach-O object file may contain command line option-like directives
 // such as "-lfoo" in its LC_LINKER_OPTION command. This function returns
 // such directives.
 template <typename E>
-std::vector<std::string> ObjectFile<E>::get_linker_options(Context<E> &ctx) {
-  if (get_file_type(ctx, this->mf) == FileType::LLVM_BITCODE)
-    return {};
-
+void ObjectFile<E>::parse_linker_options() {
   MachHeader &hdr = *(MachHeader *)this->mf->data;
   u8 *p = this->mf->data + sizeof(hdr);
-  std::vector<std::string> vec;
+  linker_options.clear();
 
   for (i64 i = 0; i < hdr.ncmds; i++) {
     LoadCommand &lc = *(LoadCommand *)p;
@@ -609,12 +699,22 @@ std::vector<std::string> ObjectFile<E>::get_linker_options(Context<E> &ctx) {
       LinkerOptionCommand *cmd = (LinkerOptionCommand *)&lc;
       char *buf = (char *)cmd + sizeof(*cmd);
       for (i64 i = 0; i < cmd->count; i++) {
-        vec.push_back(buf);
-        buf += vec.back().size() + 1;
+        linker_options.push_back(buf);
+        buf += linker_options.back().size() + 1;
       }
     }
   }
-  return vec;
+  if (!linker_options.empty()) {
+    static Counter files("num_objects_with_autolink_directives");
+    static Counter directives("num_autolink_directives_decoded");
+    files++;
+    directives += (int)linker_options.size();
+  }
+}
+
+template <typename E>
+std::span<const std::string> ObjectFile<E>::get_linker_options() const {
+  return linker_options;
 }
 
 template <typename E>
@@ -1152,6 +1252,8 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
            ((msym.desc & N_WEAK_REF) && (msym.desc & N_WEAK_DEF));
   };
 
+  std::vector<Symbol<E> *> pending_extracts;
+
   for (i64 i = 0; i < this->syms.size(); i++) {
     MachSym<E> &msym = mach_syms[i];
     if (!msym.is_extern)
@@ -1159,7 +1261,8 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
 
     Symbol<E> &sym = *this->syms[i];
     if (msym.is_undef() || msym.is_common())
-      maybe_extract_archive_member(ctx, sym);
+      if (maybe_extract_archive_member(ctx, sym))
+        pending_extracts.push_back(&sym);
 
     std::scoped_lock lock(sym.mu);
 
@@ -1172,6 +1275,21 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
       if (msym.is_undef() || (msym.is_common() && !sym.is_common))
         if (!file->is_alive.test_and_set() && !file->is_dylib)
           feeder((ObjectFile<E> *)file);
+  }
+
+  while (!pending_extracts.empty()) {
+    if (!drain_archive_member_frontier(ctx))
+      break;
+
+    std::vector<Symbol<E> *> next;
+    for (Symbol<E> *sym : pending_extracts) {
+      if (InputFile<E> *file = sym->file)
+        if (!file->is_alive.test_and_set() && !file->is_dylib)
+          feeder((ObjectFile<E> *)file);
+      if (maybe_extract_archive_member(ctx, *sym))
+        next.push_back(sym);
+    }
+    pending_extracts = std::move(next);
   }
 
   for (Subsection<E> *subsec : subsections)

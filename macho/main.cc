@@ -227,17 +227,38 @@ static void resolve_symbols(Context<E> &ctx) {
   });
 
   auto mark_live_objects = [&](bool start_finish_parse) {
+    auto drain_pending_roots = [&](std::vector<Symbol<E> *> pending) {
+      while (!pending.empty()) {
+        if (!drain_archive_member_frontier(ctx))
+          break;
+
+        std::vector<Symbol<E> *> next;
+        for (Symbol<E> *sym : pending) {
+          if (InputFile<E> *file = sym->file)
+            file->is_alive = true;
+          if (maybe_extract_archive_member(ctx, *sym))
+            next.push_back(sym);
+        }
+        pending = std::move(next);
+      }
+    };
+
     // We want to keep symbols that may be referenced indirectly.
+    std::vector<Symbol<E> *> pending_root_extracts;
     for (std::string_view name : ctx.arg.u) {
       Symbol<E> *sym = get_symbol(ctx, name);
-      maybe_extract_archive_member(ctx, *sym);
+      if (maybe_extract_archive_member(ctx, *sym))
+        pending_root_extracts.push_back(sym);
       if (InputFile<E> *file = sym->file)
         file->is_alive = true;
     }
 
-    maybe_extract_archive_member(ctx, *ctx.arg.entry);
+    if (maybe_extract_archive_member(ctx, *ctx.arg.entry))
+      pending_root_extracts.push_back(ctx.arg.entry);
     if (InputFile<E> *file = ctx.arg.entry->file)
       file->is_alive = true;
+
+    drain_pending_roots(std::move(pending_root_extracts));
 
     if (InputFile<E> *file = ctx._objc_msgSend->file; file && file->is_dylib)
       file->is_alive = true;
@@ -1272,6 +1293,9 @@ template <typename E>
 static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
 template <typename E>
+static i64 drain_incremental_linker_options(Context<E> &ctx);
+
+template <typename E>
 static void collect_hoisted_dylibs(Context<E> &ctx) {
   std::unordered_set<std::string_view> seen;
   for (DylibFile<E> *file : ctx.dylibs)
@@ -1285,14 +1309,83 @@ static void collect_hoisted_dylibs(Context<E> &ctx) {
 }
 
 template <typename E>
-static void resolve_new_files(Context<E> &ctx, i64 obj_begin, i64 dylib_begin) {
-  for (i64 i = obj_begin; i < ctx.objs.size(); i++)
+static void wait_for_input_frontier(Context<E> &ctx, i64 obj_begin, i64 obj_end,
+                                    i64 dylib_begin, i64 dylib_end) {
+  for (i64 i = obj_begin; i < obj_end; i++)
     ctx.objs[i]->wait_for_parse();
 
-  for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
+  for (i64 i = dylib_begin; i < dylib_end; i++)
     ctx.dylibs[i]->wait_for_parse();
+}
 
-  collect_hoisted_dylibs(ctx);
+template <typename E>
+static void wait_for_new_input_frontier(Context<E> &ctx, i64 &obj_begin,
+                                        i64 &dylib_begin,
+                                        Counter *wait_frontiers = nullptr,
+                                        Counter *wait_objs = nullptr,
+                                        Counter *wait_dylibs = nullptr,
+                                        Counter *autolink_waits = nullptr,
+                                        Counter *autolink_wait_objs = nullptr,
+                                        Counter *autolink_wait_dylibs = nullptr,
+                                        Timer<Context<E>> *parent = nullptr,
+                                        const char *autolink_wait_timer = nullptr) {
+  for (;;) {
+    bool launched_autolink = drain_incremental_linker_options(ctx) > 0;
+    i64 obj_end = ctx.objs.size();
+    i64 dylib_end = ctx.dylibs.size();
+
+    if (obj_begin == obj_end && dylib_begin == dylib_end) {
+      if (!launched_autolink)
+        break;
+      continue;
+    }
+
+    if (wait_frontiers)
+      (*wait_frontiers)++;
+    if (wait_objs)
+      (*wait_objs) += (int)(obj_end - obj_begin);
+    if (wait_dylibs)
+      (*wait_dylibs) += (int)(dylib_end - dylib_begin);
+
+    if (launched_autolink) {
+      if (autolink_waits)
+        (*autolink_waits)++;
+      if (autolink_wait_objs)
+        (*autolink_wait_objs) += (int)(obj_end - obj_begin);
+      if (autolink_wait_dylibs)
+        (*autolink_wait_dylibs) += (int)(dylib_end - dylib_begin);
+    }
+
+    if (launched_autolink && autolink_wait_timer) {
+      Timer t(ctx, autolink_wait_timer, parent);
+      wait_for_input_frontier(ctx, obj_begin, obj_end, dylib_begin, dylib_end);
+    } else {
+      wait_for_input_frontier(ctx, obj_begin, obj_end, dylib_begin, dylib_end);
+    }
+
+    collect_hoisted_dylibs(ctx);
+    obj_begin = ctx.objs.size();
+    dylib_begin = ctx.dylibs.size();
+  }
+}
+
+template <typename E>
+static void resolve_new_files(Context<E> &ctx, i64 obj_begin, i64 dylib_begin,
+                              Counter *wait_frontiers = nullptr,
+                              Counter *wait_objs = nullptr,
+                              Counter *wait_dylibs = nullptr,
+                              Counter *autolink_waits = nullptr,
+                              Counter *autolink_wait_objs = nullptr,
+                              Counter *autolink_wait_dylibs = nullptr,
+                              Timer<Context<E>> *parent = nullptr,
+                              const char *autolink_wait_timer = nullptr) {
+  i64 wait_obj_begin = obj_begin;
+  i64 wait_dylib_begin = dylib_begin;
+  wait_for_new_input_frontier(ctx, wait_obj_begin, wait_dylib_begin,
+                              wait_frontiers, wait_objs, wait_dylibs,
+                              autolink_waits, autolink_wait_objs,
+                              autolink_wait_dylibs, parent,
+                              autolink_wait_timer);
 
   for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
     ctx.dylibs[i]->resolve_symbols(ctx);
@@ -1416,9 +1509,13 @@ static void read_bundle(Context<E> &ctx, std::string name) {
 }
 
 template <typename E>
-static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
-  std::vector<std::string> opts = file.get_linker_options(ctx);
+static i64 process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
+  std::span<const std::string> opts = file.get_linker_options();
+  if (opts.empty())
+    return 0;
+
   ReaderContext orig = ctx.reader;
+  i64 num_inputs_loaded = 0;
 
   auto warn_bad_linker_option = [&](std::string_view opt) {
     Warn(ctx) << file << ": ignoring unsupported LC_LINKER_OPTION command: " << opt;
@@ -1426,6 +1523,13 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
 
   auto warn_malformed_linker_option = [&](std::string_view opt) {
     Warn(ctx) << file << ": ignoring malformed LC_LINKER_OPTION command: " << opt;
+  };
+
+  auto note_incremental_load = [&](auto &&fn) {
+    i64 num_objs = ctx.objs.size();
+    i64 num_dylibs = ctx.dylibs.size();
+    if (fn() && (ctx.objs.size() != num_objs || ctx.dylibs.size() != num_dylibs))
+      num_inputs_loaded++;
   };
 
   for (i64 j = 0; j < opts.size();) {
@@ -1445,7 +1549,7 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
       if (opt != "-framework")
         ctx.reader.needed = true;
 
-      read_framework(ctx, opts[j + 1], false);
+      note_incremental_load([&] { return read_framework(ctx, opts[j + 1], false); });
       j += 2;
       continue;
     }
@@ -1460,7 +1564,7 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
       if (opt == "-needed-l")
         ctx.reader.needed = true;
 
-      read_library(ctx, opts[j + 1], false);
+      note_incremental_load([&] { return read_library(ctx, opts[j + 1], false); });
       j += 2;
       continue;
     }
@@ -1473,8 +1577,11 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
       }
 
       ctx.reader.needed = true;
-      read_library(ctx, std::string(opt.substr(std::string_view("-needed-l").size())),
-                   false);
+      note_incremental_load([&] {
+        return read_library(ctx,
+                            std::string(opt.substr(std::string_view("-needed-l").size())),
+                            false);
+      });
       j++;
       continue;
     }
@@ -1486,7 +1593,8 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
         continue;
       }
 
-      read_library(ctx, std::string(opt.substr(2)), false);
+      note_incremental_load(
+        [&] { return read_library(ctx, std::string(opt.substr(2)), false); });
       j++;
       continue;
     }
@@ -1496,6 +1604,29 @@ static void process_linker_options(Context<E> &ctx, ObjectFile<E> &file) {
   }
 
   ctx.reader = orig;
+  return num_inputs_loaded;
+}
+
+template <typename E>
+static i64 drain_incremental_linker_options(Context<E> &ctx) {
+  std::vector<ObjectFile<E> *> files = ctx.take_parsed_object_autolink_frontier();
+  if (files.empty())
+    return 0;
+
+  static Counter autolink_files("num_objects_with_incremental_autolink");
+  static Counter autolink_loads("num_autolink_loads_launched_incrementally");
+
+  Timer t(ctx, "process_linker_options");
+  i64 launched = 0;
+
+  for (ObjectFile<E> *file : files) {
+    if (!file->get_linker_options().empty())
+      autolink_files++;
+    launched += process_linker_options(ctx, *file);
+  }
+
+  autolink_loads += (int)launched;
+  return launched;
 }
 
 template <typename E>
@@ -1505,6 +1636,7 @@ static ObjectFile<E> *load_archive_member(Context<E> &ctx,
     return member.file;
 
   static Counter counter("num_archive_members_extracted");
+  static Counter async_counter("num_archive_members_extracted_async");
   member.is_loaded = true;
 
   MappedFile<Context<E>> *mf;
@@ -1529,10 +1661,15 @@ static ObjectFile<E> *load_archive_member(Context<E> &ctx,
   ctx.reader = saved;
 
   counter++;
+  async_counter++;
   file->priority = member.priority;
   member.file = file;
+  if (ctx.pending_archive_obj_begin < 0) {
+    ctx.pending_archive_obj_begin = ctx.objs.size();
+    ctx.pending_archive_dylib_begin = ctx.dylibs.size();
+  }
   ctx.objs.push_back(file);
-  file->parse(ctx);
+  ctx.tg.run([file, &ctx] { file->parse(ctx); });
   return file;
 }
 
@@ -1690,6 +1827,12 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
   static Counter direct_inputs("num_direct_input_args");
   static Counter filelist_inputs("num_filelist_entries");
+  static Counter parser_frontiers("num_input_parser_frontiers");
+  static Counter parser_frontier_objs("num_input_parser_frontier_objects");
+  static Counter parser_frontier_dylibs("num_input_parser_frontier_dylibs");
+  static Counter autolink_waits("num_autolink_parser_wait_frontiers");
+  static Counter autolink_wait_objs("num_autolink_parser_wait_objects");
+  static Counter autolink_wait_dylibs("num_autolink_parser_wait_dylibs");
 
   while (!args.empty()) {
     const std::string &opt = args[0];
@@ -1766,19 +1909,15 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   if (!ctx.arg.bundle_loader.empty())
     read_bundle(ctx, ctx.arg.bundle_loader);
 
-  // An object file can contain linker directives to load other object
-  // files or libraries, so process them if any. We accept the common
-  // autolink forms and warn for the rest instead of hard-failing.
-  {
-    Timer t2(ctx, "process_linker_options");
-    for (i64 i = 0; i < ctx.objs.size(); i++)
-      process_linker_options(ctx, *ctx.objs[i]);
-  }
-
   {
     Timer t2(ctx, "wait_input_parsers");
-    ctx.tg.wait();
-    collect_hoisted_dylibs(ctx);
+    i64 obj_begin = 0;
+    i64 dylib_begin = 0;
+    wait_for_new_input_frontier(ctx, obj_begin, dylib_begin,
+                                &parser_frontiers, &parser_frontier_objs,
+                                &parser_frontier_dylibs, &autolink_waits,
+                                &autolink_wait_objs, &autolink_wait_dylibs,
+                                &t2, "wait_input_parsers_autolink");
   }
 
   if (ctx.objs.empty())
@@ -1790,7 +1929,36 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 }
 
 template <typename E>
-void maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym) {
+bool drain_archive_member_frontier(Context<E> &ctx) {
+  if (ctx.pending_archive_obj_begin < 0)
+    return false;
+
+  static Counter batches("num_archive_frontier_batches");
+  static Counter batch_objs("num_archive_frontier_batch_objects");
+  static Counter batch_dylibs("num_archive_frontier_batch_dylibs");
+  static Counter wait_frontiers("num_archive_resolver_wait_frontiers");
+  static Counter wait_objs("num_archive_resolver_wait_objects");
+  static Counter wait_dylibs("num_archive_resolver_wait_dylibs");
+
+  Timer t(ctx, "resolve_archive_frontier");
+  i64 obj_begin = ctx.pending_archive_obj_begin;
+  i64 dylib_begin = ctx.pending_archive_dylib_begin;
+
+  batches++;
+  resolve_new_files(ctx, obj_begin, dylib_begin, &wait_frontiers, &wait_objs,
+                    &wait_dylibs, nullptr, nullptr, nullptr, &t,
+                    "wait_input_parsers_archive_frontier");
+  batch_objs += (int)(ctx.objs.size() - obj_begin);
+  batch_dylibs += (int)(ctx.dylibs.size() - dylib_begin);
+
+  ctx.pending_archive_obj_begin = -1;
+  ctx.pending_archive_dylib_begin = -1;
+  ctx.pending_archive_symbols.clear();
+  return true;
+}
+
+template <typename E>
+bool maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym) {
   auto should_extract = [&](const Symbol<E> &sym) {
     if (!sym.file)
       return true;
@@ -1803,30 +1971,24 @@ void maybe_extract_archive_member(Context<E> &ctx, Symbol<E> &sym) {
 
   auto it = ctx.archive_symbol_map.find(sym.name);
   if (it == ctx.archive_symbol_map.end())
-    return;
+    return false;
 
-  while (should_extract(sym)) {
-    bool loaded = false;
+  if (!should_extract(sym))
+    return false;
 
-    for (ArchiveMember<E> *member : it->second) {
-      if (member->is_loaded)
-        continue;
+  if (!ctx.pending_archive_symbols.insert(&sym).second)
+    return false;
 
-      i64 obj_begin = ctx.objs.size();
-      i64 dylib_begin = ctx.dylibs.size();
-      ObjectFile<E> *file = load_archive_member(ctx, *member);
-      if (!file)
-        continue;
+  for (ArchiveMember<E> *member : it->second) {
+    if (member->is_loaded)
+      continue;
 
-      process_linker_options(ctx, *file);
-      resolve_new_files(ctx, obj_begin, dylib_begin);
-      loaded = true;
-      break;
-    }
-
-    if (!loaded)
-      break;
+    if (load_archive_member(ctx, *member))
+      return true;
   }
+
+  ctx.pending_archive_symbols.erase(&sym);
+  return false;
 }
 
 template <typename E>
@@ -1965,6 +2127,13 @@ int macho_main(int argc, char **argv) {
 
   if (ctx.output_type == MH_EXECUTE && !ctx.arg.entry->file)
     Error(ctx) << "undefined entry point symbol: " << *ctx.arg.entry;
+
+  {
+    Timer t2(ctx, "materialize_local_symbols");
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      file->materialize_local_symbols(ctx);
+    });
+  }
 
   create_internal_file(ctx);
 

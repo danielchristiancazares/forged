@@ -80,12 +80,13 @@ void InputSection<E>::parse_relocations(Context<E> &ctx) {
   {
     Timer t(ctx, "read_relocations_section", &timer);
     i64 start = file.rels_pool.size();
-    bool rels_are_sorted = read_relocations(ctx, file, hdr, file.rels_pool);
+    read_relocations(ctx, file, hdr, file.rels_pool);
     rels = std::span<Relocation<E>>(file.rels_pool).subspan(start);
-    if (!rels_are_sorted && rels.size() > 1) {
-      Timer t(ctx, "sort_relocations_section", &timer);
-      sort_relocations_by_offset(rels);
-    }
+  }
+
+  if (rels.size() > 1) {
+    Timer t(ctx, "sort_relocations_section", &timer);
+    sort_relocations_by_offset(rels);
   }
 
   std::span<Subsection<E> *> subsecs = get_subsections();

@@ -211,7 +211,7 @@ static void resolve_object_symbols(Context<E> &ctx,
     while (j < candidates.size() && candidates[j].sym == candidates[i].sym)
       j++;
 
-    if (candidates[i].rank <= get_symbol_rank(*candidates[i].sym))
+    if (candidates[i].rank < get_symbol_rank(*candidates[i].sym))
       apply_object_symbol_candidate(*candidates[i].sym, candidates[i]);
     i = j;
   }
@@ -221,12 +221,12 @@ template <typename E>
 static void resolve_symbols(Context<E> &ctx) {
   Timer t(ctx, "resolve_symbols");
 
-  resolve_object_symbols(ctx, ctx.objs);
+  resolve_object_symbols(ctx, std::span(ctx.objs));
   tbb::parallel_for_each(ctx.dylibs, [&](DylibFile<E> *file) {
     file->resolve_symbols(ctx);
   });
 
-  auto mark_live_objects = [&] {
+  auto mark_live_objects = [&](bool start_finish_parse) {
     // We want to keep symbols that may be referenced indirectly.
     for (std::string_view name : ctx.arg.u) {
       Symbol<E> *sym = get_symbol(ctx, name);
@@ -255,17 +255,20 @@ static void resolve_symbols(Context<E> &ctx) {
       live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
         live_objs.push_back(file);
       });
+
+      if (start_finish_parse && live_objs[i]->can_start_finish_parse_early())
+        live_objs[i]->start_finish_parse(ctx);
     }
   };
 
   // Choose archive members before running LTO so archive IR obeys regular
   // archive extraction semantics. Rerun reachability after LTO because the
   // synthesized object may reference additional archive members.
-  mark_live_objects();
+  mark_live_objects(!has_lto_obj(ctx));
 
   if (has_lto_obj(ctx)) {
     do_lto(ctx);
-    mark_live_objects();
+    mark_live_objects(true);
   }
 
   std::vector<InputFile<E> *> files;
@@ -287,7 +290,7 @@ static void resolve_symbols(Context<E> &ctx) {
 
   // Redo symbol resolution because extracting object files from archives
   // may raise the priority of symbols defined by the object file.
-  resolve_object_symbols(ctx, live_objs);
+  resolve_object_symbols(ctx, std::span(live_objs));
   tbb::parallel_for_each(ctx.dylibs, [&](DylibFile<E> *file) {
     if (file->is_alive)
       file->resolve_symbols(ctx);
@@ -671,6 +674,7 @@ template <typename E>
 static void finish_parsing_archive_members(Context<E> &ctx) {
   Timer t(ctx, "finish_parsing_archive_members");
   static Counter counter("num_archive_members_finish_parsed");
+  static Counter late_started("num_archive_members_finish_parse_started_late");
 
   auto get_backing_mf = [](ObjectFile<E> *file) {
     if (file->mf->parent)
@@ -693,8 +697,10 @@ static void finish_parsing_archive_members(Context<E> &ctx) {
     if (file->needs_finish_parse())
       pending.push_back(file);
 
-  if (pending.empty())
+  if (pending.empty()) {
+    ctx.wait_archive_finish_early();
     return;
+  }
 
   sort(pending, [&](ObjectFile<E> *a, ObjectFile<E> *b) {
     MappedFile<Context<E>> *mf_a = get_backing_mf(a);
@@ -710,15 +716,42 @@ static void finish_parsing_archive_members(Context<E> &ctx) {
     return a->priority < b->priority;
   });
 
-  static constexpr i64 GRAIN_SIZE = 8;
+  // On x86_64 Rust links, starting every pending archive member at once can
+  // steal too much scheduler attention from the symbol-resolution tail.
+  if constexpr (E::cputype == CPU_TYPE_X86_64) {
+    i64 num_workers =
+      std::min<i64>(ctx.get_archive_finish_lane_width(), (i64)pending.size());
+    std::atomic<i64> next = 0;
+    tbb::task_group tg;
 
-  tbb::parallel_for(tbb::blocked_range<i64>(0, (i64)pending.size(), GRAIN_SIZE),
-                    [&](const tbb::blocked_range<i64> &range) {
-    for (i64 i = range.begin(); i < range.end(); i++) {
-      counter++;
-      pending[i]->finish_parse(ctx);
+    for (i64 i = 0; i < num_workers; i++) {
+      tg.run([&] {
+        while (true) {
+          i64 idx = next.fetch_add(1, std::memory_order_relaxed);
+          if (idx >= pending.size())
+            return;
+          if (pending[idx]->finish_parse_now(ctx)) {
+            counter++;
+            late_started++;
+          }
+        }
+      });
     }
-  });
+
+    tg.wait();
+    ctx.wait_archive_finish_early();
+    return;
+  }
+
+  for (ObjectFile<E> *file : pending) {
+    if (file->start_finish_parse(ctx)) {
+      counter++;
+      late_started++;
+    }
+  }
+
+  ctx.tg.wait();
+  ctx.wait_archive_finish_early();
 }
 
 template <typename E>
@@ -1253,7 +1286,12 @@ static void collect_hoisted_dylibs(Context<E> &ctx) {
 
 template <typename E>
 static void resolve_new_files(Context<E> &ctx, i64 obj_begin, i64 dylib_begin) {
-  ctx.tg.wait();
+  for (i64 i = obj_begin; i < ctx.objs.size(); i++)
+    ctx.objs[i]->wait_for_parse();
+
+  for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
+    ctx.dylibs[i]->wait_for_parse();
+
   collect_hoisted_dylibs(ctx);
 
   for (i64 i = dylib_begin; i < ctx.dylibs.size(); i++)
@@ -1909,6 +1947,7 @@ int macho_main(int argc, char **argv) {
 
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
                                ctx.arg.thread_count);
+  ctx.init_archive_finish_early_lane();
 
   if (ctx.arg.adhoc_codesign)
     ctx.code_sig.reset(new CodeSignatureSection<E>(ctx));

@@ -112,7 +112,7 @@ static i64 read_addend(u8 *buf, const MachRel &r) {
 }
 
 template <>
-void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
+bool read_relocations(Context<E> &ctx, ObjectFile<E> &file,
                       const MachSection<E> &hdr,
                       std::vector<Relocation<E>> &vec) {
   i64 start = vec.size();
@@ -160,15 +160,17 @@ void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
     }
   };
 
-  bool reverse_sorted = true;
+  bool increasing = true;
+  bool decreasing = true;
+
   for (i64 i = 1; i < hdr.nreloc; i++) {
-    if (rels[i - 1].offset < rels[i].offset) {
-      reverse_sorted = false;
-      break;
-    }
+    if (rels[i - 1].offset > rels[i].offset)
+      increasing = false;
+    if (rels[i - 1].offset < rels[i].offset)
+      decreasing = false;
   }
 
-  if (reverse_sorted) {
+  if (decreasing) {
     i64 out = 0;
 
     for (i64 i = hdr.nreloc; i > 0;) {
@@ -184,10 +186,12 @@ void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
     }
 
     ASSERT(out == hdr.nreloc);
-  } else {
-    for (i64 i = 0; i < hdr.nreloc; i++)
-      fill(rels_out[i], rels[i], i);
+    return true;
   }
+
+  for (i64 i = 0; i < hdr.nreloc; i++)
+    fill(rels_out[i], rels[i], i);
+  return increasing;
 }
 
 template <>

@@ -44,7 +44,6 @@ ObjectFile<E> *
 ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                       std::string archive_name) {
   ObjectFile<E> *obj = new ObjectFile<E>(mf);
-  obj->prepare_for_parse();
   obj->archive_name = archive_name;
   obj->is_alive = archive_name.empty() || ctx.reader.all_load;
   obj->is_hidden = ctx.reader.hidden;
@@ -54,11 +53,6 @@ ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
 
 template <typename E>
 void ObjectFile<E>::parse(Context<E> &ctx) {
-  struct ParseNotifier {
-    ObjectFile<E> &file;
-    ~ParseNotifier() { file.notify_parse_complete(); }
-  } notifier{*this};
-
   Timer timer(ctx, "parse_object");
 
   if (get_file_type(ctx, this->mf) == FileType::LLVM_BITCODE) {
@@ -117,10 +111,7 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
     });
   }
 
-  {
-    Timer t(ctx, "assign_input_section_subranges_object", &timer);
-    cache_subsection_spans();
-  }
+  cache_subsection_spans();
 
   {
     Timer t(ctx, "build_subsection_lookup_object", &timer);
@@ -141,7 +132,7 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
     return;
   }
 
-  finish_parse_now(ctx);
+  finish_parse(ctx);
 }
 
 template <typename E>
@@ -172,7 +163,7 @@ void ObjectFile<E>::finish_parse(Context<E> &ctx) {
       parse_eh_frame(ctx);
     }
 
-  if (unwind_sec || eh_frame_sec) {
+  {
     Timer t(ctx, "associate_compact_unwind_object", &timer);
     associate_compact_unwind(ctx);
   }
@@ -184,45 +175,6 @@ void ObjectFile<E>::finish_parse(Context<E> &ctx) {
     }
 
   fully_parsed = true;
-}
-
-template <typename E>
-bool ObjectFile<E>::finish_parse_now(Context<E> &ctx) {
-  bool started = false;
-  std::call_once(finish_parse_once, [&] {
-    if (!fully_parsed) {
-      started = true;
-      finish_parse(ctx);
-    }
-  });
-  return started;
-}
-
-template <typename E>
-bool ObjectFile<E>::start_finish_parse(Context<E> &ctx) {
-  bool started = false;
-  std::call_once(finish_parse_once, [&] {
-    if (fully_parsed)
-      return;
-    started = true;
-
-    if constexpr (E::cputype == CPU_TYPE_X86_64) {
-      if (ctx.use_archive_finish_early_lane() && can_start_finish_parse_early()) {
-        static Counter early_started("num_archive_members_finish_parse_started_early");
-        early_started++;
-        ctx.enqueue_archive_finish_early([this, &ctx] { finish_parse(ctx); });
-        return;
-      }
-    }
-
-    ctx.tg.run([this, &ctx] { finish_parse(ctx); });
-  });
-  return started;
-}
-
-template <typename E>
-bool ObjectFile<E>::can_start_finish_parse_early() const {
-  return !this->archive_name.empty() && !may_have_common_symbols;
 }
 
 template <typename E>
@@ -541,7 +493,6 @@ template <typename E>
 void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
   SymtabCommand *cmd = (SymtabCommand *)find_load_command(ctx, LC_SYMTAB);
   this->syms.resize(mach_syms.size());
-  may_have_common_symbols = false;
 
   i64 nlocal = 0;
   for (MachSym<E> &msym : mach_syms)
@@ -556,7 +507,6 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
 
     // Global symbol
     if (msym.is_extern) {
-      may_have_common_symbols |= msym.is_common();
       this->syms[i] = get_symbol(ctx, name);
       continue;
     }
@@ -1629,7 +1579,6 @@ DylibFile<E>::DylibFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
 template <typename E>
 DylibFile<E> *DylibFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   DylibFile<E> *file = new DylibFile<E>(ctx, mf);
-  file->prepare_for_parse();
   file->priority = ctx.next_dylib_priority++;
   ctx.dylib_pool.emplace_back(file);
   return file;
@@ -1692,11 +1641,6 @@ find_external_lib(Context<E> &ctx, DylibFile<E> &loader, std::string path) {
 
 template <typename E>
 void DylibFile<E>::parse(Context<E> &ctx) {
-  struct ParseNotifier {
-    DylibFile<E> &file;
-    ~ParseNotifier() { file.notify_parse_complete(); }
-  } notifier{*this};
-
   switch (get_file_type(ctx, this->mf)) {
   case FileType::TAPI:
     parse_tapi(ctx);

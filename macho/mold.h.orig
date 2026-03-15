@@ -5,7 +5,6 @@
 #include "../common/common.h"
 
 #include <functional>
-#include <condition_variable>
 #include <map>
 #include <memory>
 #include <optional>
@@ -13,7 +12,7 @@
 #include <span>
 #include <tbb/concurrent_hash_map.h>
 #include <tbb/spin_mutex.h>
-#include <tbb/task_arena.h>
+#include <tbb/task_group.h>
 #include <tbb/task_group.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -140,15 +139,6 @@ public:
   virtual void populate_symtab(Context<E> &ctx) = 0;
 
   void clear_symbols();
-  void prepare_for_parse() {
-    std::scoped_lock lock(parse_mu);
-    parse_complete = false;
-  }
-
-  void wait_for_parse() {
-    std::unique_lock lock(parse_mu);
-    parse_cv.wait(lock, [&] { return parse_complete; });
-  }
 
   MappedFile<Context<E>> *mf = nullptr;
   std::string_view filename;
@@ -174,21 +164,8 @@ public:
   std::string oso_name;
 
 protected:
-  void notify_parse_complete() {
-    {
-      std::scoped_lock lock(parse_mu);
-      parse_complete = true;
-    }
-    parse_cv.notify_all();
-  }
-
   InputFile(MappedFile<Context<E>> *mf) : mf(mf), filename(mf->name) {}
   InputFile() : filename("<internal>") {}
-
-private:
-  std::mutex parse_mu;
-  std::condition_variable parse_cv;
-  bool parse_complete = true;
 };
 
 template <typename E>
@@ -201,10 +178,7 @@ public:
                             std::string archive_name);
   void parse(Context<E> &ctx);
   void finish_parse(Context<E> &ctx);
-  bool finish_parse_now(Context<E> &ctx);
-  bool start_finish_parse(Context<E> &ctx);
   bool needs_finish_parse() const;
-  bool can_start_finish_parse_early() const;
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
   std::vector<std::string> get_linker_options(Context<E> &ctx);
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
@@ -269,9 +243,7 @@ private:
   InputSection<E> *common_sec = nullptr;
   i64 total_nreloc = 0;
   bool has_debug_info = false;
-  bool may_have_common_symbols = false;
-  Atomic<bool> fully_parsed = false;
-  std::once_flag finish_parse_once;
+  bool fully_parsed = false;
 
   static constexpr u32 SUBSECTION_LOOKUP_SHIFT = 8;
   static constexpr u32 NO_SUBSECTION = -1;
@@ -392,7 +364,7 @@ public:
 };
 
 template <typename E>
-bool read_relocations(Context<E> &ctx, ObjectFile<E> &file,
+void read_relocations(Context<E> &ctx, ObjectFile<E> &file,
                       const MachSection<E> &hdr,
                       std::vector<Relocation<E>> &vec);
 
@@ -1253,45 +1225,9 @@ struct Context {
     std::vector<std::string> u;
   } arg;
 
-  i64 get_archive_finish_lane_width() const {
-    if constexpr (E::cputype != CPU_TYPE_X86_64)
-      return 0;
-    return std::max<i64>(1, std::min<i64>(2, arg.thread_count / 4));
-  }
-
-  void init_archive_finish_early_lane() {
-    if constexpr (E::cputype != CPU_TYPE_X86_64)
-      return;
-    archive_finish_early_arena.initialize((int)get_archive_finish_lane_width());
-    archive_finish_early_enabled = true;
-  }
-
-  bool use_archive_finish_early_lane() const {
-    if constexpr (E::cputype != CPU_TYPE_X86_64)
-      return false;
-    return archive_finish_early_enabled;
-  }
-
-  template <typename F>
-  void enqueue_archive_finish_early(F fn) {
-    ASSERT(use_archive_finish_early_lane());
-    archive_finish_early_arena.execute([&] {
-      archive_finish_early_tg.run(std::move(fn));
-    });
-  }
-
-  void wait_archive_finish_early() {
-    if (!use_archive_finish_early_lane())
-      return;
-    archive_finish_early_arena.execute([&] { archive_finish_early_tg.wait(); });
-  }
-
   ReaderContext reader;
   std::vector<std::string_view> cmdline_args;
   tbb::task_group tg;
-  bool archive_finish_early_enabled = false;
-  tbb::task_arena archive_finish_early_arena;
-  tbb::task_group archive_finish_early_tg;
   u32 output_type = MH_EXECUTE;
   i64 next_object_priority = 10000;
   i64 next_dylib_priority = 8'000'000;

@@ -533,12 +533,25 @@ def ensure_supported_host() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark sold against Apple ld on captured Rust link commands.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark sold against Apple ld (and optionally LLVM ld64.lld) on captured Rust link commands."
+    )
     parser.add_argument("--corpus", default="benchmarks/corpus.toml", help="Path to the corpus manifest")
     parser.add_argument("--out-dir", default="benchmarks/out", help="Directory for captures, logs, and results")
     parser.add_argument("--apple-ld", help="Path to Apple ld; defaults to xcrun -f ld")
     parser.add_argument("--real-linker", default="clang", help="Real linker driver used during capture")
     parser.add_argument("--sold-bin", required=True, help="Path to sold binary or ld64 symlink")
+    parser.add_argument(
+        "--lld-bin",
+        help="Optional path to LLVM Mach-O linker (e.g. ld64.lld from a LLVM build or brew --prefix llvm)",
+    )
+    parser.add_argument(
+        "--require-lld",
+        dest="require_lld",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --lld-bin is set, fail the run if the lld replay fails (default: record lld failures but still exit 0)",
+    )
     parser.add_argument(
         "--target",
         dest="target_names",
@@ -576,6 +589,7 @@ def main() -> int:
     )
     sold_bin = pathlib.Path(args.sold_bin).resolve()
     sold_ld64 = make_ld64_entrypoint(sold_bin, out_dir)
+    lld_bin = pathlib.Path(args.lld_bin).resolve() if args.lld_bin else None
     capture_tool = pathlib.Path(__file__).with_name("capture_linker.py").resolve()
 
     targets = load_targets(corpus_path)
@@ -615,6 +629,12 @@ def main() -> int:
         (target_dir / "apple-ld-command.json").write_text(json.dumps(apple_argv, indent=2) + "\n")
         (target_dir / "sold-ld-command.json").write_text(json.dumps(sold_argv, indent=2) + "\n")
 
+        lld_argv: list[str] | None = None
+        if lld_bin is not None:
+            lld_argv = list(apple_argv)
+            lld_argv[0] = str(lld_bin)
+            (target_dir / "lld-ld-command.json").write_text(json.dumps(lld_argv, indent=2) + "\n")
+
         replay_cwd = pathlib.Path(str(capture_record["cwd"]))
         apple_result = benchmark_linker(
             name="apple_ld",
@@ -634,6 +654,17 @@ def main() -> int:
             warmups=args.warmups,
             runs=args.runs,
         )
+        lld_result: dict[str, object] | None = None
+        if lld_bin is not None and lld_argv is not None:
+            lld_result = benchmark_linker(
+                name="lld",
+                argv=lld_argv,
+                replay_cwd=replay_cwd,
+                target=target,
+                target_out_dir=target_dir,
+                warmups=args.warmups,
+                runs=args.runs,
+            )
         if args.collect_sold_perf:
             sold_result.update(
                 collect_linker_perf(
@@ -646,6 +677,8 @@ def main() -> int:
             )
 
         results.extend([apple_result, sold_result])
+        if lld_result is not None:
+            results.append(lld_result)
 
         win_pct = None
         if apple_result["median_wall_s"] and sold_result["median_wall_s"]:
@@ -653,15 +686,29 @@ def main() -> int:
                 apple_result["median_wall_s"]
             ) * 100.0
 
-        comparisons.append(
-            {
-                "target": target.name,
-                "apple_median_wall_s": apple_result["median_wall_s"],
-                "sold_median_wall_s": sold_result["median_wall_s"],
-                "sold_win_pct": win_pct,
-                "threshold_pct": args.min_win_pct,
-            }
-        )
+        sold_vs_lld_win_pct = None
+        lld_vs_apple_win_pct = None
+        if lld_result is not None and lld_result.get("median_wall_s") and sold_result.get("median_wall_s"):
+            sold_vs_lld_win_pct = (
+                float(lld_result["median_wall_s"]) - float(sold_result["median_wall_s"])
+            ) / float(lld_result["median_wall_s"]) * 100.0
+        if lld_result is not None and lld_result.get("median_wall_s") and apple_result.get("median_wall_s"):
+            lld_vs_apple_win_pct = (
+                float(apple_result["median_wall_s"]) - float(lld_result["median_wall_s"])
+            ) / float(apple_result["median_wall_s"]) * 100.0
+
+        comp: dict[str, object] = {
+            "target": target.name,
+            "apple_median_wall_s": apple_result["median_wall_s"],
+            "sold_median_wall_s": sold_result["median_wall_s"],
+            "sold_win_pct": win_pct,
+            "threshold_pct": args.min_win_pct,
+        }
+        if lld_result is not None:
+            comp["lld_median_wall_s"] = lld_result["median_wall_s"]
+            comp["sold_vs_lld_win_pct"] = sold_vs_lld_win_pct
+            comp["lld_vs_apple_win_pct"] = lld_vs_apple_win_pct
+        comparisons.append(comp)
 
     summary = {
         "apple_ld": str(apple_ld),
@@ -672,12 +719,17 @@ def main() -> int:
         "sold_entrypoint": str(sold_ld64),
         "comparisons": comparisons,
     }
+    if lld_bin is not None:
+        summary["lld_bin"] = str(lld_bin)
+        summary["require_lld"] = args.require_lld
     results_path = out_dir / "results.json"
     results_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
     failures = []
     for result in results:
         if result["exit_status"] != 0 or not result["smoke_pass"]:
+            if result["linker"] == "lld" and lld_bin is not None and not args.require_lld:
+                continue
             failures.append(f"{result['target']}:{result['linker']}")
 
     for comparison in comparisons:

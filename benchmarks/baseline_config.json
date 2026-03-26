@@ -1,0 +1,17 @@
+{
+  "host_specs": {
+    "cpu": "Intel(R) Xeon(R) W-3223 CPU @ 3.50GHz",
+    "ram_bytes": 171798691840,
+    "macos_version": "26.3.1"
+  },
+  "build_type": "Release",
+  "cmake_flags": [
+    "-DCMAKE_BUILD_TYPE=Release"
+  ],
+  "benchmark_policy": {
+    "warmups": 3,
+    "runs": 10,
+    "out_dir": "benchmarks/out-mvp",
+    "comparison": "sold_vs_apple_ld"
+  }
+}

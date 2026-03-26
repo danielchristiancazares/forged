@@ -317,9 +317,14 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
   if (ctx.arg.function_starts)
     vec.push_back(create_function_starts_cmd(ctx));
 
-  for (DylibFile<E> *file : ctx.dylibs)
-    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
-      vec.push_back(create_load_dylib_cmd(ctx, *file));
+  std::unordered_set<std::string_view> seen;
+  for (DylibFile<E> *file : ctx.dylibs) {
+    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE) {
+      if (seen.insert(file->install_name).second) {
+        vec.push_back(create_load_dylib_cmd(ctx, *file));
+      }
+    }
+  }
 
   for (std::string_view rpath : ctx.arg.rpaths)
     vec.push_back(create_rpath_cmd(ctx, rpath));

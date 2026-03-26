@@ -398,6 +398,12 @@ python3 benchmarks/run.py \
   --corpus benchmarks/corpus.toml \
   --target tools-mcp \
   --sold-bin ./build/mold
+
+python3 benchmarks/run.py \
+  --corpus benchmarks/corpus.toml \
+  --target tools-mcp \
+  --sold-bin ./build/ld64 \
+  --lld-bin "$(brew --prefix llvm)/bin/ld64.lld"
 ```
 
 Useful flags:
@@ -407,6 +413,7 @@ Useful flags:
 - `--no-cargo-clean`: reuse an existing benchmark-owned Cargo target dir
 - `--warmups <n>` and `--runs <n>`: control benchmark length
 - `--min-win-pct <pct>`: required sold win threshold
+- `--lld-bin <path>`: also benchmark LLVM Mach-O `ld64.lld` (optional; failures are recorded unless `--require-lld`)
 
 ## Template Instantiation Strategy
 

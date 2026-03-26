@@ -1290,7 +1290,10 @@ strip_universal_header(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf);
+using ArchiveReadResultMap = tbb::concurrent_hash_map<MappedFile<Context<E>> *, ArchiveReadResult<Context<E>, MappedFile<Context<E>>>>;
+
+template <typename E>
+static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf, ArchiveReadResultMap<E> *parsed_archives = nullptr);
 
 template <typename E>
 static i64 drain_incremental_linker_options(Context<E> &ctx);
@@ -1306,6 +1309,75 @@ static void collect_hoisted_dylibs(Context<E> &ctx) {
     for (DylibFile<E> *file : ctx.dylibs[i]->hoisted_libs)
       if (seen.insert(file->install_name).second)
         ctx.dylibs.push_back(file);
+}
+
+// Multiple input paths can open the same logical dylib (e.g. libc hoists
+// libSystem, then the link line passes -lSystem). ctx.dylibs must list each
+// install name at most once or the output repeats LC_LOAD_DYLIB and modern
+// dyld aborts.
+template <typename E>
+static void dedup_dylibs_by_install_name(Context<E> &ctx) {
+  std::unordered_map<std::string, DylibFile<E> *> canonical_by_install;
+  std::unordered_map<DylibFile<E> *, DylibFile<E> *> redirect;
+  canonical_by_install.reserve(ctx.dylibs.size());
+  redirect.reserve(ctx.dylibs.size());
+
+  std::vector<DylibFile<E> *> kept;
+  kept.reserve(ctx.dylibs.size());
+
+  for (DylibFile<E> *file : ctx.dylibs) {
+    if (file->dylib_idx == BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE) {
+      kept.push_back(file);
+      continue;
+    }
+
+    if (file->install_name.empty()) {
+      kept.push_back(file);
+      continue;
+    }
+
+    std::string key(file->install_name);
+    auto it = canonical_by_install.find(key);
+    if (it == canonical_by_install.end()) {
+      canonical_by_install.emplace(std::move(key), file);
+      kept.push_back(file);
+      continue;
+    }
+
+    DylibFile<E> *canonical = it->second;
+    redirect.emplace(file, canonical);
+
+    canonical->is_alive = canonical->is_alive || file->is_alive;
+    canonical->is_weak = canonical->is_weak && file->is_weak;
+    canonical->is_reexported = canonical->is_reexported || file->is_reexported;
+    canonical->is_hidden = canonical->is_hidden || file->is_hidden;
+  }
+
+  for (auto &[name, ptr] : ctx.lib_dylibs) {
+    if (auto r = redirect.find(ptr); r != redirect.end())
+      ptr = r->second;
+  }
+
+  for (auto &[name, ptr] : ctx.framework_dylibs) {
+    if (auto r = redirect.find(ptr); r != redirect.end())
+      ptr = r->second;
+  }
+
+  for (DylibFile<E> *file : kept) {
+    std::vector<DylibFile<E> *> new_hoisted;
+    new_hoisted.reserve(file->hoisted_libs.size());
+    std::unordered_set<DylibFile<E> *> seen_hoisted;
+    for (DylibFile<E> *h : file->hoisted_libs) {
+      DylibFile<E> *t = h;
+      if (auto r = redirect.find(h); r != redirect.end())
+        t = r->second;
+      if (seen_hoisted.insert(t).second)
+        new_hoisted.push_back(t);
+    }
+    file->hoisted_libs = std::move(new_hoisted);
+  }
+
+  ctx.dylibs = std::move(kept);
 }
 
 template <typename E>
@@ -1698,10 +1770,18 @@ static void record_archive_fallback(Context<E> &ctx, MappedFile<Context<E>> *mf,
 }
 
 template <typename E>
-static ArchiveIndexStatus add_archive(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+static ArchiveIndexStatus add_archive(Context<E> &ctx, MappedFile<Context<E>> *mf, ArchiveReadResultMap<E> *parsed_archives = nullptr) {
   Timer t(ctx, "index_archive");
-  ArchiveReadResult<Context<E>, MappedFile<Context<E>>> result =
-    read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+  ArchiveReadResult<Context<E>, MappedFile<Context<E>>> result;
+  if (parsed_archives) {
+    typename ArchiveReadResultMap<E>::accessor acc;
+    if (parsed_archives->find(acc, mf))
+      result = std::move(acc->second);
+    else
+      result = read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+  } else {
+    result = read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+  }
   if (!result.info)
     return result.status;
   ArchiveFileInfo<Context<E>, MappedFile<Context<E>>> &info = *result.info;
@@ -1749,7 +1829,7 @@ static ArchiveIndexStatus add_archive(Context<E> &ctx, MappedFile<Context<E>> *m
 }
 
 template <typename E>
-static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf, ArchiveReadResultMap<E> *parsed_archives) {
   if (get_file_type(ctx, mf) == FileType::MACH_UNIVERSAL)
     mf = strip_universal_header(ctx, mf);
 
@@ -1773,7 +1853,7 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   case FileType::AR:
   case FileType::THIN_AR:
     if (!ctx.arg.ObjC && !ctx.reader.all_load) {
-      ArchiveIndexStatus status = add_archive(ctx, mf);
+      ArchiveIndexStatus status = add_archive(ctx, mf, parsed_archives);
       if (status == ArchiveIndexStatus::OK)
         break;
       record_archive_fallback(ctx, mf, status);
@@ -1834,13 +1914,35 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   static Counter autolink_wait_objs("num_autolink_parser_wait_objects");
   static Counter autolink_wait_dylibs("num_autolink_parser_wait_dylibs");
 
+  ArchiveReadResultMap<E> parsed_archives;
+
+  std::vector<std::string> direct_args;
+  for (std::string_view opt : args)
+    if (!opt.starts_with('-'))
+      direct_args.push_back(std::string(opt));
+
+  tbb::parallel_for_each(direct_args, [&](const std::string &opt) {
+    if (MappedFile<Context<E>> *mf = open_cached_input(ctx, opt)) {
+      FileType type = get_file_type(ctx, mf);
+      if (type == FileType::AR || type == FileType::THIN_AR) {
+        auto res = read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+        typename ArchiveReadResultMap<E>::accessor acc;
+        parsed_archives.insert(acc, mf);
+        acc->second = std::move(res);
+      }
+    }
+  });
+
   while (!args.empty()) {
     const std::string &opt = args[0];
     args = args.subspan(1);
 
     if (!opt.starts_with('-')) {
       direct_inputs++;
-      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, opt));
+      MappedFile<Context<E>> *mf = open_cached_input(ctx, opt);
+      if (!mf)
+        Fatal(ctx) << "cannot open " << opt;
+      read_file(ctx, mf, &parsed_archives);
       continue;
     }
 
@@ -1864,11 +1966,24 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     if (opt == "-filelist") {
       std::vector<std::string> paths = read_filelist(ctx, arg);
       filelist_inputs += paths.size();
+
+      tbb::parallel_for_each(paths, [&](const std::string &path) {
+        if (MappedFile<Context<E>> *mf = open_cached_input(ctx, path)) {
+          FileType type = get_file_type(ctx, mf);
+          if (type == FileType::AR || type == FileType::THIN_AR) {
+            auto res = read_archive_file<Context<E>, MappedFile<Context<E>>>(ctx, mf);
+            typename ArchiveReadResultMap<E>::accessor acc;
+            parsed_archives.insert(acc, mf);
+            acc->second = std::move(res);
+          }
+        }
+      });
+
       for (std::string &path : paths) {
-        MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
+        MappedFile<Context<E>> *mf = open_cached_input(ctx, path);
         if (!mf)
           Fatal(ctx) << "-filelist " << arg << ": cannot open file: " << path;
-        read_file(ctx, mf);
+        read_file(ctx, mf, &parsed_archives);
       }
     } else if (opt == "-force_load") {
       ctx.reader.all_load = true;
@@ -1919,6 +2034,8 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
                                 &autolink_wait_objs, &autolink_wait_dylibs,
                                 &t2, "wait_input_parsers_autolink");
   }
+
+  dedup_dylibs_by_install_name(ctx);
 
   if (ctx.objs.empty())
     Fatal(ctx) << "no input files";

@@ -5,6 +5,14 @@ The harness captures the exact linker-driver argv that `rustc` emits during
 `cargo build`, derives the concrete Apple `ld` command via `clang -###`, and
 then replays that final link in isolation against Apple `ld` and `sold`.
 
+Optionally, pass `--lld-bin` to also benchmark **LLVM’s Mach-O linker**
+(`ld64.lld`, the same binary Homebrew installs as `lld` / under
+`$(brew --prefix llvm)/bin/ld64.lld`). The replay uses the same argv as Apple
+`ld` with `argv[0]` replaced by that path. LLVM lld may not accept every Apple
+`ld` flag on a given capture; by default a failed or invalid lld replay is
+recorded in `results.json` but does **not** fail the harness exit status. Use
+`--require-lld` to treat lld failures like sold failures.
+
 Cargo builds are redirected into a benchmark-owned target directory under
 `benchmarks/out/targets/<name>/cargo-target` so the harness does not mutate
 or race with the source project's normal `target/` tree.
@@ -26,6 +34,14 @@ or race with the source project's normal `target/` tree.
 python3 benchmarks/run.py --sold-bin /path/to/ld64
 ```
 
+Apple ld vs LLVM lld vs sold (example on Homebrew LLVM):
+
+```sh
+python3 benchmarks/run.py \
+  --sold-bin ./build/ld64 \
+  --lld-bin "$(brew --prefix llvm)/bin/ld64.lld"
+```
+
 If `--sold-bin` points to the built `mold` executable instead of an `ld64`
 symlink, the runner creates a temporary `ld64.sold` symlink automatically so
 the Mach-O entrypoint is selected.
@@ -40,7 +56,10 @@ comparison.
 
 Results are written to `benchmarks/out/results.json`. Per-target captures,
 derived commands, replay logs, and binaries are written under
-`benchmarks/out/targets/`.
+`benchmarks/out/targets/`. When `--lld-bin` is set, each target also writes
+`lld-ld-command.json`, and `comparisons[]` includes `lld_median_wall_s`,
+`sold_vs_lld_win_pct` (positive when sold is faster than lld), and
+`lld_vs_apple_win_pct` (positive when lld is faster than Apple ld).
 
 When `--collect-sold-perf` is enabled, sold results in `results.json` also
 include:
